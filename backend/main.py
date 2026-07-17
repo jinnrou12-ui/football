@@ -34,13 +34,34 @@ from ultralytics import YOLO
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Football Video Analysis Studio API", version="1.0.0")
 
+class PrivateNetworkMiddleware:
+    """ASGI middleware to append Access-Control-Allow-Private-Network header for Chrome LNA compatibility."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            async def send_wrapper(message):
+                if message["type"] == "http.response.start":
+                    req_headers = dict(scope.get("headers", []))
+                    if b"access-control-request-private-network" in req_headers:
+                        headers_list = message.get("headers", [])
+                        has_pna = any(h[0].lower() == b"access-control-allow-private-network" for h in headers_list)
+                        if not has_pna:
+                            headers_list.append((b"access-control-allow-private-network", b"true"))
+                await send(message)
+            await self.app(scope, receive, send_wrapper)
+        else:
+            await self.app(scope, receive, send)
+
+app.add_middleware(PrivateNetworkMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],          # tighten for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_private_network=True,
 )
 
 # ---------------------------------------------------------------------------
