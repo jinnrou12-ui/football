@@ -33,7 +33,7 @@ yarn-debug.log*
 yarn-error.log*
 
 # React build
-frontend/build/
+build/
 
 # Environment
 .env
