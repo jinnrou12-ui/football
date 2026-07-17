@@ -1,8 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-const API_BASE_URL = 'http://localhost:8000';
-
 function App() {
+  const [apiBaseUrl, setApiBaseUrl] = useState(() => {
+    return localStorage.getItem('football_tracker_api_url') || 'http://localhost:8000';
+  });
+
+  const API_BASE_URL = apiBaseUrl;
+
   const [file, setFile] = useState(null);
   const [fileUrl, setFileUrl] = useState(null);
   const [trackerColor, setTrackerColor] = useState('#FF0000');
@@ -318,6 +322,41 @@ function App() {
                   onChange={(e) => setTrackerColor(e.target.value)}
                 />
                 <span className="color-hex-label">{trackerColor.toUpperCase()}</span>
+              </div>
+            </div>
+
+            {/* Backend API Configuration */}
+            <div style={{ marginTop: '20px', borderTop: '1px solid var(--border)', paddingTop: '15px' }}>
+              <span className="section-label">Backend Connection</span>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '6px' }}>
+                <input
+                  type="text"
+                  value={apiBaseUrl}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setApiBaseUrl(val);
+                    localStorage.setItem('football_tracker_api_url', val);
+                  }}
+                  style={{
+                    width: '100%',
+                    padding: '8px 10px',
+                    border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-sm)',
+                    background: 'var(--bg-panel)',
+                    color: 'var(--text-primary)',
+                    fontSize: '12px',
+                    fontFamily: "'Inter', sans-serif"
+                  }}
+                  placeholder="http://localhost:8000"
+                />
+                <span style={{ fontSize: '10px', color: 'var(--text-muted)', lineHeight: '1.4' }}>
+                  {window.location.protocol === 'https:' && apiBaseUrl.startsWith('http://localhost') && (
+                    <span style={{ color: '#F43F5E', display: 'block', marginBottom: '4px' }}>
+                      ⚠️ Chrome blocks HTTPS websites from requesting HTTP localhost. Run frontend locally or use an HTTPS tunnel (e.g. ngrok).
+                    </span>
+                  )}
+                  Configure backend target. Default is local uvicorn on port 8000.
+                </span>
               </div>
             </div>
 
