@@ -705,6 +705,7 @@ def process_video(job_id: str,
         possessor_lost_frames = 0
         possessor_durations = {}
         tag_decays = {}
+        last_active_player_box = None
 
         # Goal scorer tracking state
         goal_scorer_track_id = None
@@ -743,12 +744,42 @@ def process_video(job_id: str,
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                if cls_id == 0 and conf > 0.15:          # player (lower threshold strictly for active players / overall tracking boost)
-                    players_small.append((x1, y1, x2, y2))
+                if cls_id == 0:
+                    # Player: check if it matches the active possessor player from previous frame
+                    is_active_player = False
+                    if last_active_player_box is not None:
+                        ax1, ay1, ax2, ay2 = last_active_player_box
+                        # Calculate IoU or distance to determine if it is the same active player
+                        xA = max(x1, ax1)
+                        yA = max(y1, ay1)
+                        xB = min(x2, ax2)
+                        yB = min(y2, ay2)
+                        interArea = max(0, xB - xA) * max(0, yB - yA)
+                        boxArea = (x2 - x1) * (y2 - y1)
+                        activeArea = (ax2 - ax1) * (ay2 - ay1)
+                        unionArea = boxArea + activeArea - interArea
+                        iou = interArea / float(unionArea) if unionArea > 0 else 0
+                        
+                        cx = (x1 + x2) / 2.0
+                        cy = (y1 + y2) / 2.0
+                        acx = (ax1 + ax2) / 2.0
+                        acy = (ay1 + ay2) / 2.0
+                        dist = math.sqrt((cx - acx)**2 + (cy - acy)**2)
+                        
+                        if iou > 0.2 or dist < 40.0:
+                            is_active_player = True
+                    
+                    # Strictly lower threshold for the active player (0.15) to prevent dropouts,
+                    # while maintaining a higher threshold (0.35) for off-ball players to keep the field clean.
+                    required_conf = 0.15 if is_active_player else 0.35
+                    if conf > required_conf:
+                        players_small.append((x1, y1, x2, y2))
                 elif cls_id == 32:                       # ball
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    r = max(4, (x2 - x1 + y2 - y1) // 4)
-                    ball_candidates_small.append(((cx, cy), r, conf))
+                    # Ball: strictly lower confidence to 0.05
+                    if conf > 0.05:
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        r = max(4, (x2 - x1 + y2 - y1) // 4)
+                        ball_candidates_small.append(((cx, cy), r, conf))
 
             # Update tracked players in 640x360
             tracked_players_small = player_tracker.update(players_small)
@@ -850,6 +881,23 @@ def process_video(job_id: str,
                     last_ball_radius = 6
                     ball_lost_frames = 0
                     kf.initialized = False
+
+            # Calculate active player box for the next frame's strict tracking conf boost
+            last_active_player_box = None
+            scaled_threshold = 80.0 * (640.0 / width)
+            if current_ball is not None and tracked_players_small:
+                bx, by = current_ball
+                min_dist = float("inf")
+                closest_box = None
+                for track_id, (x1, y1, x2, y2) in tracked_players_small:
+                    fx = (x1 + x2) // 2
+                    fy = y2
+                    dist = euclidean(bx, by, fx, fy)
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_box = (x1, y1, x2, y2)
+                if min_dist <= scaled_threshold:
+                    last_active_player_box = closest_box
 
             raw_ball_centers.append(current_ball)
             raw_ball_radii.append(current_radius)
