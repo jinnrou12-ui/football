@@ -148,25 +148,105 @@ def apply_possession_highlight(frame: np.ndarray,
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
 
 
-def blur_player_region(frame: np.ndarray,
-                        x1: int, y1: int, x2: int, y2: int,
-                        protection_mask: np.ndarray | None = None) -> None:
-    """Gaussian-blur a player's region in-place, respecting the protection mask if provided."""
+def blur_player_box_with_alpha(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, alpha: float) -> None:
+    if alpha <= 0.0:
+        return
     h, w = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1:
+    roi_w = x2 - x1
+    roi_h = y2 - y1
+    if roi_w <= 5 or roi_h <= 5:
         return
-
+        
     roi = frame[y1:y2, x1:x2]
-    blurred = cv2.GaussianBlur(roi, (15, 15), 0)
-
-    if protection_mask is not None:
-        roi_mask = protection_mask[y1:y2, x1:x2]
-        mask_3d = np.expand_dims(roi_mask, axis=2)
-        frame[y1:y2, x1:x2] = (roi * (1 - mask_3d) + blurred * mask_3d).astype(np.uint8)
-    else:
+    
+    # Ensure kernel size is odd and smaller than the ROI dimensions
+    kw = (roi_w // 2) * 2 - 1
+    kh = (roi_h // 2) * 2 - 1
+    kw = max(3, min(25, kw))
+    kh = max(3, min(25, kh))
+    
+    if kw % 2 == 0: kw += 1
+    if kh % 2 == 0: kh += 1
+    
+    blurred = cv2.GaussianBlur(roi, (kw, kh), 0)
+    
+    if alpha >= 1.0:
         frame[y1:y2, x1:x2] = blurred
+    else:
+        cv2.addWeighted(blurred, alpha, roi, 1.0 - alpha, 0, frame[y1:y2, x1:x2])
+
+
+def apply_player_bounding_box_blur(frame: np.ndarray, 
+                                   players_small: list[tuple[int, list[int]]], 
+                                   blur_factors: dict[int, float], 
+                                   x_scale: float, 
+                                   y_scale: float) -> np.ndarray:
+    """
+    Applies Gaussian blur exclusively within the bounding boxes of off-ball players on the high-resolution frame.
+    Base frame (background, grass field) remains 100% clear.
+    """
+    frame_out = frame.copy()
+    for tid, (x1, y1, x2, y2) in players_small:
+        alpha = blur_factors.get(tid, 1.0)
+        if alpha > 0.0:
+            px1 = int(round(x1 * x_scale))
+            py1 = int(round(y1 * y_scale))
+            px2 = int(round(x2 * x_scale))
+            py2 = int(round(y2 * y_scale))
+            
+            blur_player_box_with_alpha(frame_out, px1, py1, px2, py2, alpha)
+            
+    return frame_out
+
+
+def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_size: int = 5) -> list[tuple[int, int] | None]:
+    N = len(ball_centers)
+    filled_centers = list(ball_centers)
+    
+    # Pass 1: Gap filling (linear interpolation for gaps of up to window_size frames)
+    for i in range(N):
+        if filled_centers[i] is None:
+            left_val = None
+            left_idx = -1
+            for j in range(i - 1, max(-1, i - window_size - 1), -1):
+                if filled_centers[j] is not None:
+                    left_val = filled_centers[j]
+                    left_idx = j
+                    break
+            
+            right_val = None
+            right_idx = -1
+            for j in range(i + 1, min(N, i + window_size + 1)):
+                if filled_centers[j] is not None:
+                    right_val = filled_centers[j]
+                    right_idx = j
+                    break
+            
+            if left_val is not None and right_val is not None:
+                diff = right_idx - left_idx
+                ratio = (i - left_idx) / float(diff)
+                x = left_val[0] + (right_val[0] - left_val[0]) * ratio
+                y = left_val[1] + (right_val[1] - left_val[1]) * ratio
+                filled_centers[i] = (int(round(x)), int(round(y)))
+    
+    # Pass 2: Temporal smoothing (moving average filter)
+    smoothed_centers = [None] * N
+    for i in range(N):
+        if filled_centers[i] is not None:
+            vals = []
+            for j in range(max(0, i - 2), min(N, i + 3)):
+                if filled_centers[j] is not None:
+                    vals.append(filled_centers[j])
+            if vals:
+                mean_x = sum(v[0] for v in vals) / len(vals)
+                mean_y = sum(v[1] for v in vals) / len(vals)
+                smoothed_centers[i] = (int(round(mean_x)), int(round(mean_y)))
+        else:
+            smoothed_centers[i] = None
+            
+    return smoothed_centers
 
 
 def draw_name_tag(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, name: str, tracker_color: tuple[int, int, int]) -> None:
@@ -214,58 +294,242 @@ def draw_name_tag(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, name: s
     cv2.putText(frame, name.upper(), (tx, ty), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
+def draw_name_tag_with_alpha(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, name: str, tracker_color: tuple[int, int, int], alpha: float = 1.0) -> None:
+    """Draw the name tag with alpha blending for smooth fade transitions."""
+    if alpha <= 0.0:
+        return
+    if alpha >= 1.0:
+        draw_name_tag(frame, x1, y1, x2, y2, name, tracker_color)
+        return
+        
+    cx = (x1 + x2) // 2
+    cy = y1 - 10
+    
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 2
+    text_size = cv2.getTextSize(name.upper(), font, font_scale, thickness)[0]
+    tw, th = text_size[0], text_size[1]
+    
+    padding_x = 8
+    padding_y = 5
+    pill_w = tw + 2 * padding_x
+    pill_h = th + 2 * padding_y
+    
+    pill_x1 = cx - pill_w // 2
+    pill_y1 = cy - pill_h - 10 - 5
+    pill_x2 = cx + pill_w // 2
+    pill_y2 = cy + 5
+    
+    h_f, w_f = frame.shape[:2]
+    pill_x1 = max(0, min(w_f - 1, pill_x1))
+    pill_y1 = max(0, min(h_f - 1, pill_y1))
+    pill_x2 = max(0, min(w_f - 1, pill_x2))
+    pill_y2 = max(0, min(h_f - 1, pill_y2))
+    
+    if pill_x2 <= pill_x1 or pill_y2 <= pill_y1:
+        return
+        
+    roi = frame[pill_y1:pill_y2, pill_x1:pill_x2].copy()
+    dx = -pill_x1
+    dy = -pill_y1
+    draw_name_tag(roi, x1 + dx, y1 + dy, x2 + dx, y2 + dy, name, tracker_color)
+    cv2.addWeighted(roi, alpha, frame[pill_y1:pill_y2, pill_x1:pill_x2], 1.0 - alpha, 0, frame[pill_y1:pill_y2, pill_x1:pill_x2])
+
+
 class IoUTracker:
-    def __init__(self, iou_threshold=0.3, max_lost_frames=30):
+    def __init__(self, iou_threshold=0.25, max_lost_frames=30, max_render_lost_frames=10):
         self.iou_threshold = iou_threshold
         self.max_lost_frames = max_lost_frames
+        self.max_render_lost_frames = max_render_lost_frames
         self.next_id = 1
-        self.tracks = {}  # id -> {"box": (x1, y1, x2, y2), "lost_frames": int}
+        # tracks: id -> {"box": (x1, y1, x2, y2), "lost_frames": int, "velocity": (vx, vy)}
+        self.tracks = {}
 
     def update(self, detections):
-        updated_tracks = {}
-        matched_detections = set()
+        # 1. Project all existing tracks using their velocity
+        projected_boxes = {}
+        for track_id, track_data in self.tracks.items():
+            box = track_data["box"]
+            vx, vy = track_data.get("velocity", (0.0, 0.0))
+            proj_box = (box[0] + vx, box[1] + vy, box[2] + vx, box[3] + vy)
+            projected_boxes[track_id] = proj_box
 
+        # 2. Compute similarity matrix using projected boxes, distances, and velocity consistency
+        candidates = []
         for track_id, track_data in self.tracks.items():
             if track_data["lost_frames"] > self.max_lost_frames:
                 continue
+            
+            proj_box = projected_boxes[track_id]
+            proj_cx = (proj_box[0] + proj_box[2]) / 2.0
+            proj_cy = (proj_box[1] + proj_box[3]) / 2.0
+            
+            old_box = track_data["box"]
+            old_cx = (old_box[0] + old_box[2]) / 2.0
+            old_cy = (old_box[1] + old_box[3]) / 2.0
+            
+            vx, vy = track_data.get("velocity", (0.0, 0.0))
+            track_speed = math.sqrt(vx**2 + vy**2)
+            
+            # Dynamic matching distance based on speed
+            max_match_dist = 45.0 + 2.0 * track_speed
+            
+            for det_idx, det in enumerate(detections):
+                iou = self.calculate_iou(proj_box, det)
+                det_cx = (det[0] + det[2]) / 2.0
+                det_cy = (det[1] + det[3]) / 2.0
+                dist = math.sqrt((proj_cx - det_cx)**2 + (proj_cy - det_cy)**2)
+                
+                # Direction consistency score (ID-memory lock)
+                dir_consistency = 0.0
+                if track_speed > 2.0:
+                    dx = det_cx - old_cx
+                    dy = det_cy - old_cy
+                    disp_len = math.sqrt(dx**2 + dy**2)
+                    if disp_len > 0.5:
+                        cos_sim = (vx * dx + vy * dy) / (track_speed * disp_len)
+                        # Reward same direction, penalize opposite direction
+                        dir_consistency = 0.3 * cos_sim
+                        
+                # Allow matching if there is either reasonable IoU overlap or very close proximity
+                if iou >= self.iou_threshold or dist < max_match_dist:
+                    score = iou + dir_consistency
+                    if dist < 20.0:
+                        score += 0.3
+                    candidates.append((score, track_id, det_idx, dist))
 
-            best_iou = 0
-            best_det_idx = -1
+        # Sort candidates by score descending to perform global competitive matching
+        candidates.sort(key=lambda x: x[0], reverse=True)
 
-            for idx, det in enumerate(detections):
-                if idx in matched_detections:
-                    continue
-                iou = self.calculate_iou(track_data["box"], det)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_det_idx = idx
+        matched_tracks = {}
+        matched_detections = set()
 
-            if best_iou >= self.iou_threshold:
+        for score, track_id, det_idx, dist in candidates:
+            if track_id in matched_tracks or det_idx in matched_detections:
+                continue
+            
+            matched_tracks[track_id] = det_idx
+            matched_detections.add(det_idx)
+
+        # Estimate camera motion (global displacement) from matched tracks
+        dx_list = []
+        dy_list = []
+        for track_id, det_idx in matched_tracks.items():
+            new_box = detections[det_idx]
+            old_box = self.tracks[track_id]["box"]
+            old_cx = (old_box[0] + old_box[2]) / 2.0
+            old_cy = (old_box[1] + old_box[3]) / 2.0
+            new_cx = (new_box[0] + new_box[2]) / 2.0
+            new_cy = (new_box[1] + new_box[3]) / 2.0
+            dx_list.append(new_cx - old_cx)
+            dy_list.append(new_cy - old_cy)
+            
+        if len(dx_list) > 0:
+            camera_dx = float(np.median(dx_list))
+            camera_dy = float(np.median(dy_list))
+        else:
+            camera_dx = 0.0
+            camera_dy = 0.0
+
+        # 3. Update track states
+        updated_tracks = {}
+        for track_id, track_data in self.tracks.items():
+            if track_id in matched_tracks:
+                det_idx = matched_tracks[track_id]
+                new_box = detections[det_idx]
+                old_box = track_data["box"]
+                
+                # Calculate new velocity components
+                old_cx = (old_box[0] + old_box[2]) / 2.0
+                old_cy = (old_box[1] + old_box[3]) / 2.0
+                new_cx = (new_box[0] + new_box[2]) / 2.0
+                new_cy = (new_box[1] + new_box[3]) / 2.0
+                
+                raw_vx = new_cx - old_cx
+                raw_vy = new_cy - old_cy
+                
+                prev_vx, prev_vy = track_data.get("velocity", (0.0, 0.0))
+                
+                # Cap velocity to prevent extreme drift from bad detections/noise
+                max_v = 40.0
+                raw_vx = max(-max_v, min(max_v, raw_vx))
+                raw_vy = max(-max_v, min(max_v, raw_vy))
+                
+                # Smooth the velocity vector using exponential moving average
+                if track_data["lost_frames"] > 0:
+                    vx = prev_vx
+                    vy = prev_vy
+                else:
+                    vx = 0.7 * raw_vx + 0.3 * prev_vx
+                    vy = 0.7 * raw_vy + 0.3 * prev_vy
+
                 updated_tracks[track_id] = {
-                    "box": detections[best_det_idx],
-                    "lost_frames": 0
+                    "box": new_box,
+                    "lost_frames": 0,
+                    "velocity": (vx, vy)
                 }
-                matched_detections.add(best_det_idx)
             else:
-                updated_tracks[track_id] = {
-                    "box": track_data["box"],
-                    "lost_frames": track_data["lost_frames"] + 1
-                }
+                # If lost, apply velocity prediction + camera motion to the box so it continues moving
+                # during occlusion/motion blur.
+                if track_data["lost_frames"] <= self.max_lost_frames:
+                    old_box = track_data["box"]
+                    vx, vy = track_data.get("velocity", (0.0, 0.0))
+                    
+                    # Decelerate slightly when lost to prevent infinite drifting
+                    vx_decay = vx * 0.9
+                    vy_decay = vy * 0.9
+                    
+                    # Combine relative velocity and camera panning
+                    total_dx = vx + camera_dx
+                    total_dy = vy + camera_dy
+                    
+                    projected_box = (
+                        old_box[0] + total_dx,
+                        old_box[1] + total_dy,
+                        old_box[2] + total_dx,
+                        old_box[3] + total_dy
+                    )
+                    updated_tracks[track_id] = {
+                        "box": projected_box,
+                        "lost_frames": track_data["lost_frames"] + 1,
+                        "velocity": (vx_decay, vy_decay)
+                    }
 
+        # 4. Initialize new tracks
         for idx, det in enumerate(detections):
             if idx not in matched_detections:
                 updated_tracks[self.next_id] = {
                     "box": det,
-                    "lost_frames": 0
+                    "lost_frames": 0,
+                    "velocity": (0.0, 0.0)
                 }
                 self.next_id += 1
 
         self.tracks = updated_tracks
         
+        # 5. Gather active tracks for rendering
         active_detections = []
         for track_id, track_data in self.tracks.items():
-            if track_data["lost_frames"] == 0:
-                active_detections.append((track_id, track_data["box"]))
+            # Keep rendering tracks for a few frames even if temporarily lost,
+            # projecting their bounding boxes to avoid flicker.
+            # Sideline / camera panning / fast motion check to dynamically increase max render lost frames
+            vx, vy = track_data.get("velocity", (0.0, 0.0))
+            track_speed = math.sqrt(vx**2 + vy**2)
+            
+            box = track_data["box"]
+            is_near_boundary = (box[0] < 60 or box[2] > 580 or box[1] < 45 or box[3] > 315)
+            is_fast = (track_speed > 4.0)
+            
+            # If fast or near boundaries or camera is panning, use larger render threshold to prevent flicker
+            render_threshold = self.max_render_lost_frames
+            if is_near_boundary or is_fast or (abs(camera_dx) > 3.0 or abs(camera_dy) > 3.0):
+                render_threshold = self.max_lost_frames - 2
+                
+            if track_data["lost_frames"] <= render_threshold:
+                box_coords = [int(round(c)) for c in track_data["box"]]
+                active_detections.append((track_id, box_coords))
+                
         return active_detections
 
     def calculate_iou(self, boxA, boxB):
@@ -278,6 +542,91 @@ class IoUTracker:
         boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
         unionArea = boxAArea + boxBArea - interArea
         return interArea / float(unionArea) if unionArea > 0 else 0
+
+
+class BallKalmanFilter:
+    def __init__(self, dt=1.0):
+        # State vector: [x, y, vx, vy]
+        self.state = np.zeros((4, 1), dtype=np.float32)
+        
+        # State transition matrix F
+        self.F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+        
+        # Measurement matrix H
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+        
+        # Covariance matrix P
+        self.P = np.eye(4, dtype=np.float32) * 100.0
+        
+        # Base process noise covariance (lower values = smoother trajectory)
+        self.Q_base = np.array([
+            [0.05, 0, 0.02, 0],
+            [0, 0.05, 0, 0.02],
+            [0.02, 0, 0.5, 0],
+            [0, 0.02, 0, 0.5]
+        ], dtype=np.float32) * 0.02
+        
+        self.Q = self.Q_base.copy()
+        
+        # Base measurement noise covariance (higher values = filters out jitter, trusts model prediction more)
+        self.R_base = np.eye(2, dtype=np.float32) * 8.0
+        self.R = self.R_base.copy()
+        
+        self.initialized = False
+
+    def initialize(self, x, y):
+        self.state = np.array([[x], [y], [0], [0]], dtype=np.float32)
+        self.P = np.eye(4, dtype=np.float32) * 10.0
+        self.initialized = True
+
+    def predict(self, velocity_hint=None):
+        if velocity_hint is not None:
+            # Blend current filter velocity state with optical flow displacement hint
+            self.state[2, 0] = 0.5 * self.state[2, 0] + 0.5 * velocity_hint[0]
+            self.state[3, 0] = 0.5 * self.state[3, 0] + 0.5 * velocity_hint[1]
+            
+        # Adapt process noise Q based on velocity magnitude to prevent lag during fast moves
+        speed = math.sqrt(self.state[2, 0]**2 + self.state[3, 0]**2)
+        if speed > 12.0:
+            scale = min(5.0, speed / 12.0)
+            self.Q = self.Q_base * scale
+            self.Q[2, 2] *= scale
+            self.Q[3, 3] *= scale
+        else:
+            self.Q = self.Q_base.copy()
+
+        self.state = np.dot(self.F, self.state)
+        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
+        return float(self.state[0, 0]), float(self.state[1, 0])
+
+    def update(self, x, y, R_scale=1.0):
+        # Adapt measurement noise based on speed: trust measurement more when fast,
+        # and trust model prediction more (smooth out jitter) when slow.
+        speed = math.sqrt(self.state[2, 0]**2 + self.state[3, 0]**2)
+        
+        current_R = self.R_base * R_scale
+        if speed > 12.0:
+            trust_factor = max(0.1, 12.0 / speed)
+            current_R = current_R * trust_factor
+        else:
+            current_R = current_R * 1.5
+
+        z = np.array([[x], [y]], dtype=np.float32)
+        y_residual = z - np.dot(self.H, self.state)
+        S = np.dot(np.dot(self.H, self.P), self.H.T) + current_R
+        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
+        self.state = self.state + np.dot(K, y_residual)
+        I = np.eye(4, dtype=np.float32)
+        self.P = np.dot(I - np.dot(K, self.H), self.P)
+        return float(self.state[0, 0]), float(self.state[1, 0])
 
 
 # ---------------------------------------------------------------------------
@@ -336,13 +685,19 @@ def process_video(job_id: str,
         # Ball tracking state
         last_ball_center = None
         last_ball_radius = 12
-        ball_velocity_x = 0
-        ball_velocity_y = 0
         ball_lost_frames = 0
+        kf = BallKalmanFilter()
+        prev_gray = None
 
         # Player tracker
         player_tracker = IoUTracker()
         saved_thumbnails = set()
+        
+        # Player blur transition states (track_id -> current_blur_factor)
+        blur_factors = {}
+
+        # Player bounding box smoothing states (track_id -> [x1, y1, x2, y2])
+        smoothed_boxes = {}
 
         # Player possession tracking state (Persistent State Machine using track IDs)
         active_possessor_track_id = None
@@ -363,62 +718,82 @@ def process_video(job_id: str,
             "frames": []
         }
 
+        # Pass 1: Fast Detection & Tracking (using 640x360 downscaled frames)
+        raw_ball_centers = []
+        raw_ball_radii = []
+        raw_tracked_players_list = []
+        
         frame_idx = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+                
+            frame_small = cv2.resize(frame, (640, 360))
+            
+            # YOLO inference on 640x360 frame
+            results = model(frame_small, conf=0.1, verbose=False)[0]
 
-            results = model(frame, conf=0.1, verbose=False)[0]
-
-            players: list[tuple[int, int, int, int]] = []
-            ball_candidates: list[tuple[tuple[int, int], int, float]] = []
+            players_small = []
+            ball_candidates_small = []
 
             for box in results.boxes:
-                cls_id     = int(box.cls[0])
-                conf       = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
                 if cls_id == 0 and conf > 0.35:          # player
-                    players.append((x1, y1, x2, y2))
+                    players_small.append((x1, y1, x2, y2))
                 elif cls_id == 32:                       # ball
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    r = max(6, (x2 - x1 + y2 - y1) // 4)
-                    ball_candidates.append(((cx, cy), r, conf))
+                    r = max(4, (x2 - x1 + y2 - y1) // 4)
+                    ball_candidates_small.append(((cx, cy), r, conf))
 
-            # Update tracked players
-            tracked_players = player_tracker.update(players)
+            # Update tracked players in 640x360
+            tracked_players_small = player_tracker.update(players_small)
+            raw_tracked_players_list.append(tracked_players_small)
 
-            # Crop player thumbnails on first occurrence
-            for tid, (x1, y1, x2, y2) in tracked_players:
-                if tid not in saved_thumbnails:
-                    h_f, w_f = frame.shape[:2]
-                    px1, py1, px2, py2 = max(0, x1), max(0, y1), min(w_f, x2), min(h_f, y2)
-                    if px2 > px1 and py2 > py1:
-                        crop = frame[py1:py2, px1:px2]
-                        crop_resized = cv2.resize(crop, (120, 160))
-                        thumb_filename = f"thumb_{job_id}_{tid}.jpg"
-                        cv2.imwrite(str(THUMBNAIL_DIR / thumb_filename), crop_resized)
-                        saved_thumbnails.add(tid)
+            # Optical Flow on 640x360
+            curr_gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+            of_pred = None
+            if last_ball_center is not None and prev_gray is not None:
+                try:
+                    prev_pts = np.array([[last_ball_center[0], last_ball_center[1]]], dtype=np.float32).reshape(-1, 1, 2)
+                    curr_pts, st, err = cv2.calcOpticalFlowPyrLK(
+                        prev_gray, curr_gray, prev_pts, None, 
+                        winSize=(21, 21), maxLevel=3,
+                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+                    )
+                    if st[0][0] == 1:
+                        of_pred = (float(curr_pts[0][0][0]), float(curr_pts[0][0][1]))
+                except Exception:
+                    pass
 
-            # ----------------------------------------------------------------
-            # Ball tracking and projection
-            # ----------------------------------------------------------------
-            current_ball = None
-            current_radius = 12
-            predicted_ball = None
-            if last_ball_center is not None and ball_lost_frames < 15:
-                pred_x = last_ball_center[0] + ball_velocity_x
-                pred_y = last_ball_center[1] + ball_velocity_y
-                predicted_ball = (pred_x, pred_y)
+            # Kalman Filter prediction
+            kf_pred = None
+            if kf.initialized:
+                velocity_hint = None
+                if of_pred is not None and last_ball_center is not None:
+                    velocity_hint = (of_pred[0] - last_ball_center[0], of_pred[1] - last_ball_center[1])
+                kf_pred = kf.predict(velocity_hint)
 
+            # Combine predictions
+            ref_pos = None
+            if of_pred is not None and kf_pred is not None:
+                ref_pos = (0.7 * of_pred[0] + 0.3 * kf_pred[0], 0.7 * of_pred[1] + 0.3 * kf_pred[1])
+            elif of_pred is not None:
+                ref_pos = of_pred
+            elif kf_pred is not None:
+                ref_pos = kf_pred
+
+            # Select best candidate
             best_score = -1
             best_candidate = None
-            best_radius = 12
+            best_radius = 6
 
-            for (cx, cy), r, conf in ball_candidates:
-                if predicted_ball is not None:
-                    dist = euclidean(cx, cy, predicted_ball[0], predicted_ball[1])
+            for (cx, cy), r, conf in ball_candidates_small:
+                if ref_pos is not None:
+                    dist = euclidean(cx, cy, ref_pos[0], ref_pos[1])
                     if dist < 120:
                         score = conf * (1.0 - (dist / 120.0) * 0.4)
                         if score > best_score:
@@ -426,109 +801,179 @@ def process_video(job_id: str,
                             best_candidate = (cx, cy)
                             best_radius = r
                 else:
-                    if conf > 0.15:
+                    if conf > 0.25:
                         if conf > best_score:
                             best_score = conf
                             best_candidate = (cx, cy)
                             best_radius = r
 
-            if best_candidate is not None:
-                if last_ball_center is not None:
-                    ball_velocity_x = best_candidate[0] - last_ball_center[0]
-                    ball_velocity_y = best_candidate[1] - last_ball_center[1]
-                    max_vel = 80
-                    ball_velocity_x = max(-max_vel, min(max_vel, ball_velocity_x))
-                    ball_velocity_y = max(-max_vel, min(max_vel, ball_velocity_y))
+            # Update filter state and raw centers
+            current_ball = None
+            current_radius = last_ball_radius
 
-                current_ball = best_candidate
+            if best_candidate is not None:
+                if not kf.initialized:
+                    kf.initialize(best_candidate[0], best_candidate[1])
+                    kf_x, kf_y = float(best_candidate[0]), float(best_candidate[1])
+                else:
+                    dist_to_kf = euclidean(best_candidate[0], best_candidate[1], kf_pred[0], kf_pred[1])
+                    if dist_to_kf > 60:
+                        R_scale = 0.05
+                    else:
+                        R_scale = 1.0
+                    kf_x, kf_y = kf.update(best_candidate[0], best_candidate[1], R_scale=R_scale)
+
+                current_ball = (int(kf_x), int(kf_y))
                 current_radius = best_radius
-                last_ball_center = best_candidate
+                last_ball_center = current_ball
                 last_ball_radius = best_radius
                 ball_lost_frames = 0
             else:
-                if last_ball_center is not None and ball_lost_frames < 8:
-                    projected_x = int(last_ball_center[0] + ball_velocity_x)
-                    projected_y = int(last_ball_center[1] + ball_velocity_y)
-                    ball_velocity_x *= 0.85
-                    ball_velocity_y *= 0.85
-                    current_ball = (projected_x, projected_y)
+                if of_pred is not None and kf.initialized and ball_lost_frames < 20:
+                    kf_x, kf_y = kf.update(of_pred[0], of_pred[1], R_scale=2.5)
+                    current_ball = (int(kf_x), int(kf_y))
+                    current_radius = last_ball_radius
+                    last_ball_center = current_ball
+                    ball_lost_frames += 1
+                elif kf_pred is not None and kf.initialized and ball_lost_frames < 12:
+                    kf_x, kf_y = kf_pred[0], kf_pred[1]
+                    kf.update(kf_x, kf_y, R_scale=8.0)
+                    current_ball = (int(kf_x), int(kf_y))
                     current_radius = last_ball_radius
                     last_ball_center = current_ball
                     ball_lost_frames += 1
                 else:
                     current_ball = None
+                    current_radius = last_ball_radius
                     last_ball_center = None
-                    last_ball_radius = 12
+                    last_ball_radius = 6
                     ball_lost_frames = 0
-                    ball_velocity_x = 0
-                    ball_velocity_y = 0
+                    kf.initialized = False
 
-            ball_center = current_ball
-            ball_radius = current_radius
+            raw_ball_centers.append(current_ball)
+            raw_ball_radii.append(current_radius)
 
-            # ----------------------------------------------------------------
-            # Ball possession detection
-            # ----------------------------------------------------------------
+            prev_gray = curr_gray
+            frame_idx += 1
+            if total > 0:
+                jobs[job_id]["progress"] = int(frame_idx / total * 50)
+
+        # Pass 2: Temporal Smoothing & Gap Filling (5-frame look-ahead/look-back sliding window)
+        smoothed_ball_centers = smooth_ball_trajectory(raw_ball_centers, window_size=5)
+
+        # Pass 2.5: Precalculate possession & 10-frame look-ahead for all frames
+        raw_possessor_ids = []
+        scaled_threshold = 80.0 * (640.0 / width)
+        
+        for f_idx in range(len(raw_tracked_players_list)):
+            ball_center_small = smoothed_ball_centers[f_idx]
+            tracked_players_small = raw_tracked_players_list[f_idx]
+            
             possessor_track_id = None
-
-            if ball_center is not None and tracked_players:
-                bx, by = ball_center
+            if ball_center_small is not None and tracked_players_small:
+                bx, by = ball_center_small
                 min_dist = float("inf")
                 closest_track_id = None
                 
-                for track_id, (x1, y1, x2, y2) in tracked_players:
+                for track_id, (x1, y1, x2, y2) in tracked_players_small:
                     fx = (x1 + x2) // 2
                     fy = y2
                     dist = euclidean(bx, by, fx, fy)
                     if dist < min_dist:
                         min_dist = dist
                         closest_track_id = track_id
-
-                if min_dist <= POSSESSION_THRESHOLD_PX:
+                        
+                if min_dist <= scaled_threshold:
                     possessor_track_id = closest_track_id
-                    active_possessor_track_id = closest_track_id
-                    possessor_lost_frames = 0
-                else:
-                    if active_possessor_track_id is not None:
-                        prev_box = None
-                        for track_id, box in tracked_players:
-                            if track_id == active_possessor_track_id:
-                                prev_box = box
-                                break
+            raw_possessor_ids.append(possessor_track_id)
 
-                        if prev_box is not None:
-                            p_fx = (prev_box[0] + prev_box[2]) // 2
-                            p_fy = prev_box[3]
-                            dist_to_possessor = euclidean(bx, by, p_fx, p_fy)
-                            if dist_to_possessor < 120:
-                                possessor_track_id = active_possessor_track_id
-                            else:
-                                active_possessor_track_id = None
-                        else:
-                            active_possessor_track_id = None
-            else:
-                if active_possessor_track_id is not None and tracked_players:
-                    still_present = any(track_id == active_possessor_track_id for track_id, _ in tracked_players)
-                    if still_present and possessor_lost_frames < 45:
-                        possessor_track_id = active_possessor_track_id
-                        possessor_lost_frames += 1
-                    else:
-                        active_possessor_track_id = None
-                        possessor_lost_frames = 0
-                else:
-                    active_possessor_track_id = None
-                    possessor_lost_frames = 0
+        # Compute future receivers (up to 10 frames look-ahead)
+        future_possessor_ids = [None] * len(raw_possessor_ids)
+        future_k_list = [0] * len(raw_possessor_ids)
+        
+        for f_idx in range(len(raw_possessor_ids)):
+            curr_pos = raw_possessor_ids[f_idx]
+            for k in range(1, 11):
+                look_ahead_idx = f_idx + k
+                if look_ahead_idx >= len(raw_possessor_ids):
+                    break
+                future_pos = raw_possessor_ids[look_ahead_idx]
+                if future_pos is not None and future_pos != curr_pos:
+                    future_possessor_ids[f_idx] = future_pos
+                    future_k_list[f_idx] = k
+                    break
 
-            # Update last possessor before shot
-            if possessor_track_id is not None:
-                last_possessor_track_id_before_shot = possessor_track_id
+        # Reset VideoCapture to start from beginning
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        # Calculate dynamic alpha-blend transition speed (0.1s duration)
+        alpha_step = 1.0 / max(1.0, 0.1 * fps)
+        
+        # Scale factor from 640x360 to original width/height
+        x_scale = width / 640.0
+        y_scale = height / 360.0
+
+        frame_idx = 0
+        last_rendered_possessor = None
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            tracked_players_small = raw_tracked_players_list[frame_idx]
+            ball_center_small = smoothed_ball_centers[frame_idx]
+            ball_radius_small = raw_ball_radii[frame_idx]
+            possessor_track_id = raw_possessor_ids[frame_idx]
+            future_tid = future_possessor_ids[frame_idx]
+            future_k = future_k_list[frame_idx]
+
+            # Calculate ball velocity (for high-speed pass detection)
+            ball_speed = 0.0
+            if ball_center_small is not None and frame_idx > 0 and smoothed_ball_centers[frame_idx - 1] is not None:
+                prev_ball = smoothed_ball_centers[frame_idx - 1]
+                ball_speed = euclidean(ball_center_small[0], ball_center_small[1], prev_ball[0], prev_ball[1])
+
+            # Bounding box smoothing (in 640x360 coordinates)
+            for tid, box in tracked_players_small:
+                box_coords = [float(b) for b in box]
+                if tid in smoothed_boxes:
+                    prev_box = smoothed_boxes[tid]
+                    beta = 0.25  # smoothing factor
+                    smoothed = [
+                        prev_box[0] + (box_coords[0] - prev_box[0]) * beta,
+                        prev_box[1] + (box_coords[1] - prev_box[1]) * beta,
+                        prev_box[2] + (box_coords[2] - prev_box[2]) * beta,
+                        prev_box[3] + (box_coords[3] - prev_box[3]) * beta,
+                    ]
+                    smoothed_boxes[tid] = smoothed
+                else:
+                    smoothed_boxes[tid] = box_coords
+                    
+            # Clean up stale track IDs in smoothed_boxes
+            current_track_ids = {tid for tid, _ in tracked_players_small}
+            smoothed_boxes = {tid: val for tid, val in smoothed_boxes.items() if tid in current_track_ids}
+
+            # Crop player thumbnails on first occurrence (upscale coordinates for high-quality thumbnail)
+            for tid, (x1, y1, x2, y2) in tracked_players_small:
+                if tid not in saved_thumbnails:
+                    px1 = max(0, int(round(x1 * x_scale)))
+                    py1 = max(0, int(round(y1 * y_scale)))
+                    px2 = min(width, int(round(x2 * x_scale)))
+                    py2 = min(height, int(round(y2 * y_scale)))
+                    if px2 > px1 and py2 > py1:
+                        crop = frame[py1:py2, px1:px2]
+                        crop_resized = cv2.resize(crop, (120, 160))
+                        thumb_filename = f"thumb_{job_id}_{tid}.jpg"
+                        cv2.imwrite(str(THUMBNAIL_DIR / thumb_filename), crop_resized)
+                        saved_thumbnails.add(tid)
 
             # Goal scorer detection
             goal_scorer_active = False
-            if ball_center is not None:
-                bx, by = ball_center
-                in_left_goal = (bx < width * 0.25) and (height * 0.2 < by < height * 0.8)
-                in_right_goal = (bx > width * 0.75) and (height * 0.2 < by < height * 0.8)
+            if ball_center_small is not None:
+                bx, by = ball_center_small
+                in_left_goal = (bx < 640 * 0.25) and (360 * 0.2 < by < 360 * 0.8)
+                in_right_goal = (bx > 640 * 0.75) and (360 * 0.2 < by < 360 * 0.8)
 
                 if (in_left_goal or in_right_goal) and last_possessor_track_id_before_shot is not None:
                     goal_scorer_track_id = last_possessor_track_id_before_shot
@@ -536,7 +981,7 @@ def process_video(job_id: str,
                     last_possessor_track_id_before_shot = None
 
             if goal_scorer_frames_left > 0 and goal_scorer_track_id is not None:
-                still_present = any(track_id == goal_scorer_track_id for track_id, _ in tracked_players)
+                still_present = any(track_id == goal_scorer_track_id for track_id, _ in tracked_players_small)
                 if still_present:
                     goal_scorer_active = True
                 goal_scorer_frames_left -= 1
@@ -544,114 +989,199 @@ def process_video(job_id: str,
                 goal_scorer_track_id = None
                 goal_scorer_active = False
 
-            # Identify protected player track IDs
+            if possessor_track_id is not None:
+                last_possessor_track_id_before_shot = possessor_track_id
+
+            # Update possession change tag decays
+            if possessor_track_id != last_rendered_possessor:
+                if last_rendered_possessor is not None and last_rendered_possessor != future_tid:
+                    tag_decays[last_rendered_possessor] = 1.0
+                last_rendered_possessor = possessor_track_id
+
+            # Decay active label alphas
+            decay_step = 1.0 / max(1.0, 0.3 * fps)
+            updated_decays = {}
+            for tid, alpha in tag_decays.items():
+                new_alpha = alpha - decay_step
+                if new_alpha > 0.0 and tid in current_track_ids:
+                    if tid != possessor_track_id and tid != future_tid:
+                        updated_decays[tid] = new_alpha
+            tag_decays = updated_decays
+
+            # Find bounding boxes for possessor and receiver for overlap calculations
+            possessor_box_small = None
+            if possessor_track_id is not None:
+                for track_id, box in tracked_players_small:
+                    if track_id == possessor_track_id:
+                        possessor_box_small = box
+                        break
+
+            future_box_small = None
+            if future_tid is not None:
+                for track_id, box in tracked_players_small:
+                    if track_id == future_tid:
+                        future_box_small = box
+                        break
+
+            # Group/crossover detection: compute pairwise distances to find crowded players
+            player_centers = {}
+            for tid, box in tracked_players_small:
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                player_centers[tid] = (cx, cy)
+                
+            crowded_players = set()
+            for tid1, (cx1, cy1) in player_centers.items():
+                for tid2, (cx2, cy2) in player_centers.items():
+                    if tid1 != tid2:
+                        dist = euclidean(cx1, cy1, cx2, cy2)
+                        # If two players stand too close (less than 65 pixels in 640x360), they form a group
+                        if dist < 65.0:
+                            crowded_players.add(tid1)
+                            crowded_players.add(tid2)
+
+            # Update blur alpha factors (smooth transition: 0.1s duration)
+            for track_id, box in tracked_players_small:
+                target_alpha = 1.0
+                
+                if possessor_track_id is not None and track_id == possessor_track_id:
+                    target_alpha = 0.0
+                elif future_tid is not None and track_id == future_tid and future_k <= 10:
+                    # Smoothly transition blur to 0.0 as ball approaches receiver
+                    target_alpha = max(0.0, (future_k - 1) / 10.0)
+                elif track_id in crowded_players:
+                    # Prevent blurring crowded players/crossovers
+                    target_alpha = 0.0
+                else:
+                    # Multi-player occlusion: prevent blurring players close to or overlapping with focus
+                    if possessor_box_small is not None:
+                        overlap = get_box_overlap(box, possessor_box_small)
+                        box_area = (box[2] - box[0]) * (box[3] - box[1])
+                        overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
+                        if overlap_ratio >= 0.15:
+                            target_alpha = 0.0
+                    
+                    if target_alpha > 0.0 and future_box_small is not None:
+                        overlap = get_box_overlap(box, future_box_small)
+                        box_area = (box[2] - box[0]) * (box[3] - box[1])
+                        overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
+                        if overlap_ratio >= 0.15:
+                            target_alpha = 0.0
+
+                current_alpha = blur_factors.get(track_id, 1.0)
+                if current_alpha < target_alpha:
+                    new_alpha = min(target_alpha, current_alpha + alpha_step)
+                else:
+                    new_alpha = max(target_alpha, current_alpha - alpha_step)
+                blur_factors[track_id] = new_alpha
+
+            # Clean up stale track IDs in blur_factors
+            blur_factors = {tid: val for tid, val in blur_factors.items() if tid in current_track_ids}
+
+            # Filter out drawing highlights for players with extreme overlaps (so highlight doesn't overlap messily)
+            highlight_players = []
+            for track_id, box in tracked_players_small:
+                is_possessor = (possessor_track_id is not None and track_id == possessor_track_id)
+                is_receiver = (future_tid is not None and track_id == future_tid and future_k <= 10)
+                
+                if is_possessor:
+                    highlight_players.append((track_id, box, "possessor"))
+                elif is_receiver:
+                    highlight_players.append((track_id, box, "receiver"))
+                else:
+                    is_overlapping = False
+                    if possessor_box_small is not None:
+                        overlap = get_box_overlap(box, possessor_box_small)
+                        box_area = (box[2] - box[0]) * (box[3] - box[1])
+                        overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
+                        if overlap_ratio >= 0.35:
+                            is_overlapping = True
+                            
+                    if not is_overlapping and future_box_small is not None:
+                        overlap = get_box_overlap(box, future_box_small)
+                        box_area = (box[2] - box[0]) * (box[3] - box[1])
+                        overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
+                        if overlap_ratio >= 0.35:
+                            is_overlapping = True
+                            
+                    if not is_overlapping:
+                        highlight_players.append((track_id, box, "none"))
+
+            # Apply Gaussian blur exclusively to off-ball player bounding boxes
+            frame_out = apply_player_bounding_box_blur(frame, tracked_players_small, blur_factors, x_scale, y_scale)
+
+            # Draw the possession highlight and name tag (using upscaled smoothed coordinates)
+            for track_id, box, role in highlight_players:
+                s_box_small = smoothed_boxes.get(track_id)
+                if s_box_small is None:
+                    continue
+                s_box = [
+                    int(round(s_box_small[0] * x_scale)),
+                    int(round(s_box_small[1] * y_scale)),
+                    int(round(s_box_small[2] * x_scale)),
+                    int(round(s_box_small[3] * y_scale)),
+                ]
+                custom_name = name_mapping.get(str(track_id))
+                display_name = custom_name if custom_name else f"Player {track_id}"
+                
+                if role == "possessor":
+                    apply_possession_highlight(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], tracker_bgr)
+                    draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name, tracker_bgr, alpha=1.0)
+                elif role == "receiver":
+                    # Blend tracker_bgr with light grey/white for receiver highlight
+                    receiver_color = (
+                        int(round(tracker_bgr[0] * 0.4 + 180 * 0.6)),
+                        int(round(tracker_bgr[1] * 0.4 + 180 * 0.6)),
+                        int(round(tracker_bgr[2] * 0.4 + 180 * 0.6))
+                    )
+                    cv2.rectangle(frame_out, (s_box[0], s_box[1]), (s_box[2], s_box[3]), receiver_color, 1, cv2.LINE_AA)
+                    
+                    rec_alpha = 1.0 - (future_k / 10.0)
+                    draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name + " (REC)", receiver_color, alpha=rec_alpha)
+                elif track_id in tag_decays:
+                    alpha = tag_decays[track_id]
+                    draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name, tracker_bgr, alpha=alpha)
+
+            # Draw ball tracker ring (upscaled)
+            if ball_center_small is not None:
+                bx = int(round(ball_center_small[0] * x_scale))
+                by = int(round(ball_center_small[1] * y_scale))
+                br = int(round(ball_radius_small * x_scale))
+                draw_tracker_ring(frame_out, bx, by, tracker_bgr, radius=br)
+
+            # Build metadata frame record (save original-resolution coordinates)
             protected_track_ids = set()
             if possessor_track_id is not None:
                 protected_track_ids.add(possessor_track_id)
-
-            if ball_center is not None:
-                bx, by = ball_center
-                for track_id, (x1, y1, x2, y2) in tracked_players:
-                    d_box = dist_to_box(bx, by, x1, y1, x2, y2)
-                    if d_box <= 65.0:
-                        protected_track_ids.add(track_id)
-
-            if goal_scorer_active and goal_scorer_track_id is not None:
-                protected_track_ids.add(goal_scorer_track_id)
-
-            # Build metadata frame record
+            if future_tid is not None and future_k <= 10:
+                protected_track_ids.add(future_tid)
+                
             frame_data = {
-                "ball_center": ball_center,
-                "ball_radius": ball_radius,
+                "ball_center": [int(round(ball_center_small[0] * x_scale)), int(round(ball_center_small[1] * y_scale))] if ball_center_small is not None else None,
+                "ball_radius": int(round(ball_radius_small * x_scale)),
                 "possessor_track_id": possessor_track_id,
-                "players": [{"box": [int(x1), int(y1), int(x2), int(y2)], "track_id": int(tid)} for tid, (x1, y1, x2, y2) in tracked_players],
+                "future_possessor_track_id": future_tid,
+                "future_k": future_k,
+                "players": [
+                    {
+                        "box": [
+                            int(round(b[0] * x_scale)),
+                            int(round(b[1] * y_scale)),
+                            int(round(b[2] * x_scale)),
+                            int(round(b[3] * y_scale))
+                        ],
+                        "track_id": int(tid)
+                    } for tid, b in tracked_players_small
+                ],
                 "protected_track_ids": [int(tid) for tid in protected_track_ids],
                 "goal_scorer_track_id": int(goal_scorer_track_id) if goal_scorer_track_id is not None else None
             }
             tracking_metadata["frames"].append(frame_data)
 
-            # Create protection mask
-            h_f, w_f = frame.shape[:2]
-            protection_mask = np.ones((h_f, w_f), dtype=np.uint8)
-            for track_id, (x1, y1, x2, y2) in tracked_players:
-                if track_id in protected_track_ids:
-                    x1_p, y1_p = max(0, x1), max(0, y1)
-                    x2_p, y2_p = min(w_f, x2), min(h_f, y2)
-                    protection_mask[y1_p:y2_p, x1_p:x2_p] = 0
-
-            # Duplicate / overlap suppression
-            possessor_box = None
-            if possessor_track_id is not None:
-                for track_id, box in tracked_players:
-                    if track_id == possessor_track_id:
-                        possessor_box = box
-                        break
-
-            filtered_players = []
-            for track_id, box in tracked_players:
-                if track_id == possessor_track_id:
-                    filtered_players.append((track_id, box, True))
-                else:
-                    if possessor_box is not None:
-                        overlap = get_box_overlap(box, possessor_box)
-                        box_area = (box[2] - box[0]) * (box[3] - box[1])
-                        overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
-                        if overlap_ratio >= 0.35:
-                            continue
-                    filtered_players.append((track_id, box, False))
-
-            # Update possession durations and tag decays
-            current_possessor = possessor_track_id
-            if current_possessor is not None:
-                possessor_durations[current_possessor] = possessor_durations.get(current_possessor, 0) + 1
-                tag_decays[current_possessor] = 0
-                
-            for tid in list(possessor_durations.keys()):
-                if tid != current_possessor:
-                    duration = possessor_durations[tid]
-                    if duration > 0:
-                        decay_val = int(duration * 0.5)
-                        decay_val = max(15, min(60, decay_val))
-                        tag_decays[tid] = decay_val
-                        possessor_durations[tid] = 0
-
-            for track_id, box, is_possessor in filtered_players:
-                is_protected = track_id in protected_track_ids
-
-                if is_possessor:
-                    apply_possession_highlight(frame, box[0], box[1], box[2], box[3], tracker_bgr)
-                elif is_protected:
-                    pass
-                else:
-                    height = box[3] - box[1]
-                    width = box[2] - box[0]
-                    x1_expanded = box[0] - int(width * 0.15)
-                    x2_expanded = box[2] + int(width * 0.15)
-                    y2_expanded = box[3] + int(height * 0.25)
-                    blur_player_region(frame, x1_expanded, box[1], x2_expanded, y2_expanded, protection_mask)
-
-                # Draw player name tag (if possessing OR during possession decay period)
-                should_tag = is_possessor or (tag_decays.get(track_id, 0) > 0)
-                if should_tag:
-                    custom_name = name_mapping.get(str(track_id))
-                    display_name = custom_name if custom_name else f"Player {track_id}"
-                    draw_name_tag(frame, box[0], box[1], box[2], box[3], display_name, tracker_bgr)
-
-            # Decrement active decays
-            for tid in list(tag_decays.keys()):
-                if tag_decays[tid] > 0:
-                    tag_decays[tid] -= 1
-
-            # Draw tracker ring
-            if ball_center is not None:
-                draw_tracker_ring(frame, ball_center[0], ball_center[1], tracker_bgr, radius=ball_radius)
-
-            writer.write(frame)
+            writer.write(frame_out)
             frame_idx += 1
-
             if total > 0:
-                pct = int(frame_idx / total * 100)
-                jobs[job_id]["progress"] = pct
+                jobs[job_id]["progress"] = 50 + int(frame_idx / total * 50)
 
         cap.release()
         writer.release()
@@ -827,7 +1357,15 @@ async def update_player_names(job_id: str, payload: UpdateNamesRequest):
         
     frames_data = metadata.get("frames", [])
     frame_idx = 0
+    blur_factors = {}
+    smoothed_boxes = {}
+    tag_decays = {}
+    last_rendered_possessor = None
     
+    x_scale = width / 640.0
+    y_scale = height / 360.0
+    alpha_step = 1.0 / max(1.0, 0.1 * fps)
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -843,66 +1381,202 @@ async def update_player_names(job_id: str, payload: UpdateNamesRequest):
         ball_center = fdata.get("ball_center")
         ball_radius = fdata.get("ball_radius", 12)
         possessor_track_id = fdata.get("possessor_track_id")
+        future_tid = fdata.get("future_possessor_track_id")
+        future_k = fdata.get("future_k", 0)
         players = fdata.get("players", [])
         protected_track_ids = fdata.get("protected_track_ids", [])
         
-        h_f, w_f = frame.shape[:2]
-        protection_mask = np.ones((h_f, w_f), dtype=np.uint8)
-        
+        # Calculate ball velocity (for high-speed pass detection)
+        ball_speed = 0.0
+        if ball_center is not None and frame_idx > 0:
+            prev_fdata = frames_data[frame_idx - 1]
+            prev_ball = prev_fdata.get("ball_center")
+            if prev_ball is not None:
+                ball_speed = euclidean(ball_center[0], ball_center[1], prev_ball[0], prev_ball[1])
+
+        # Update smoothed bounding boxes for players in this frame (in original coords)
         for pdata in players:
             tid = pdata["track_id"]
-            if tid in protected_track_ids:
-                x1, y1, x2, y2 = pdata["box"]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w_f, x2), min(h_f, y2)
-                protection_mask[y1:y2, x1:x2] = 0
+            box = pdata["box"]
+            box_coords = [float(b) for b in box]
+            if tid in smoothed_boxes:
+                prev_box = smoothed_boxes[tid]
+                beta = 0.25  # smoothing factor
+                smoothed = [
+                    prev_box[0] + (box_coords[0] - prev_box[0]) * beta,
+                    prev_box[1] + (box_coords[1] - prev_box[1]) * beta,
+                    prev_box[2] + (box_coords[2] - prev_box[2]) * beta,
+                    prev_box[3] + (box_coords[3] - prev_box[3]) * beta,
+                ]
+                smoothed_boxes[tid] = smoothed
+            else:
+                smoothed_boxes[tid] = box_coords
                 
+        # Clean up stale track IDs in smoothed_boxes
+        current_track_ids = {pdata["track_id"] for pdata in players}
+        smoothed_boxes = {tid: val for tid, val in smoothed_boxes.items() if tid in current_track_ids}
+
+        # Update possession change tag decays
+        if possessor_track_id != last_rendered_possessor:
+            if last_rendered_possessor is not None and last_rendered_possessor != future_tid:
+                tag_decays[last_rendered_possessor] = 1.0
+            last_rendered_possessor = possessor_track_id
+
+        # Decay active label alphas
+        decay_step = 1.0 / max(1.0, 0.3 * fps)
+        updated_decays = {}
+        for tid, alpha in tag_decays.items():
+            new_alpha = alpha - decay_step
+            if new_alpha > 0.0 and tid in current_track_ids:
+                if tid != possessor_track_id and tid != future_tid:
+                    updated_decays[tid] = new_alpha
+        tag_decays = updated_decays
+
+        # Find possessor and future receiver boxes in this frame for overlap calculations
         possessor_box = None
         if possessor_track_id is not None:
             for pdata in players:
                 if pdata["track_id"] == possessor_track_id:
                     possessor_box = pdata["box"]
                     break
-                    
-        filtered_players = []
+
+        future_box = None
+        if future_tid is not None:
+            for pdata in players:
+                if pdata["track_id"] == future_tid:
+                    future_box = pdata["box"]
+                    break
+
+        # Scale player boxes down to 640x360 and compute crowded groups
+        players_small = []
+        player_centers = {}
         for pdata in players:
             tid = pdata["track_id"]
             box = pdata["box"]
-            if tid == possessor_track_id:
-                filtered_players.append((tid, box, True))
+            x1_s = int(round(box[0] / x_scale))
+            y1_s = int(round(box[1] / y_scale))
+            x2_s = int(round(box[2] / x_scale))
+            y2_s = int(round(box[3] / y_scale))
+            players_small.append((tid, [x1_s, y1_s, x2_s, y2_s]))
+            
+            cx = (x1_s + x2_s) / 2.0
+            cy = (y1_s + y2_s) / 2.0
+            player_centers[tid] = (cx, cy)
+            
+        crowded_players = set()
+        for tid1, (cx1, cy1) in player_centers.items():
+            for tid2, (cx2, cy2) in player_centers.items():
+                if tid1 != tid2:
+                    dist = euclidean(cx1, cy1, cx2, cy2)
+                    if dist < 65.0:
+                        crowded_players.add(tid1)
+                        crowded_players.add(tid2)
+
+        # Update blur alpha factors for all players in this frame
+        for pdata in players:
+            tid = pdata["track_id"]
+            box = pdata["box"]
+            target_alpha = 1.0
+            
+            if possessor_track_id is not None and tid == possessor_track_id:
+                target_alpha = 0.0
+            elif future_tid is not None and tid == future_tid and future_k <= 10:
+                # Smoothly transition blur to 0.0 as ball approaches receiver
+                target_alpha = max(0.0, (future_k - 1) / 10.0)
+            elif tid in crowded_players:
+                # Prevent blurring crowded players/crossovers
+                target_alpha = 0.0
             else:
+                # Multi-player occlusion: prevent blurring players close to or overlapping with focus
+                if possessor_box is not None:
+                    overlap = get_box_overlap(box, possessor_box)
+                    area = (box[2] - box[0]) * (box[3] - box[1])
+                    overlap_ratio = overlap / float(area) if area > 0 else 0
+                    if overlap_ratio >= 0.15:
+                        target_alpha = 0.0
+                
+                if target_alpha > 0.0 and future_box is not None:
+                    overlap = get_box_overlap(box, future_box)
+                    area = (box[2] - box[0]) * (box[3] - box[1])
+                    overlap_ratio = overlap / float(area) if area > 0 else 0
+                    if overlap_ratio >= 0.15:
+                        target_alpha = 0.0
+
+            current_alpha = blur_factors.get(tid, 1.0)
+            if current_alpha < target_alpha:
+                new_alpha = min(target_alpha, current_alpha + alpha_step)
+            else:
+                new_alpha = max(target_alpha, current_alpha - alpha_step)
+            blur_factors[tid] = new_alpha
+
+        # Clean up stale track IDs in blur_factors
+        blur_factors = {tid: val for tid, val in blur_factors.items() if tid in current_track_ids}
+
+        # Filter out drawing highlights for players with extreme overlaps (so highlights do not overlay messily)
+        highlight_players = []
+        for pdata in players:
+            tid = pdata["track_id"]
+            box = pdata["box"]
+            is_possessor = (possessor_track_id is not None and tid == possessor_track_id)
+            is_receiver = (future_tid is not None and tid == future_tid and future_k <= 10)
+            
+            if is_possessor:
+                highlight_players.append((tid, box, "possessor"))
+            elif is_receiver:
+                highlight_players.append((tid, box, "receiver"))
+            else:
+                is_overlapping = False
                 if possessor_box is not None:
                     overlap = get_box_overlap(box, possessor_box)
                     box_area = (box[2] - box[0]) * (box[3] - box[1])
                     overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
                     if overlap_ratio >= 0.35:
-                        continue
-                filtered_players.append((tid, box, False))
-                
-        for tid, box, is_possessor in filtered_players:
-            is_protected = tid in protected_track_ids
+                        is_overlapping = True
+                        
+                if not is_overlapping and future_box is not None:
+                    overlap = get_box_overlap(box, future_box)
+                    box_area = (box[2] - box[0]) * (box[3] - box[1])
+                    overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
+                    if overlap_ratio >= 0.35:
+                        is_overlapping = True
+                        
+                if not is_overlapping:
+                    highlight_players.append((tid, box, "none"))
+
+        # Apply Gaussian blur exclusively to off-ball player bounding boxes
+        frame_out = apply_player_bounding_box_blur(frame, players_small, blur_factors, x_scale, y_scale)
+
+        # Draw the possession highlight and name tag for the active possessor & receiver (using original coords)
+        for tid, box, role in highlight_players:
+            s_box_small = smoothed_boxes.get(tid)
+            if s_box_small is None:
+                continue
+            s_box = [int(round(b)) for b in s_box_small]
+            custom_name = name_mapping.get(str(tid))
+            display_name = custom_name if custom_name else f"Player {tid}"
             
-            if is_possessor:
-                apply_possession_highlight(frame, box[0], box[1], box[2], box[3], tracker_bgr)
-            elif is_protected:
-                pass
-            else:
-                height = box[3] - box[1]
-                width = box[2] - box[0]
-                x1_expanded = box[0] - int(width * 0.15)
-                x2_expanded = box[2] + int(width * 0.15)
-                y2_expanded = box[3] + int(height * 0.25)
-                blur_player_region(frame, x1_expanded, box[1], x2_expanded, y2_expanded, protection_mask)
+            if role == "possessor":
+                apply_possession_highlight(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], tracker_bgr)
+                draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name, tracker_bgr, alpha=1.0)
+            elif role == "receiver":
+                # Blend tracker_bgr with light grey/white for receiver highlight
+                receiver_color = (
+                    int(round(tracker_bgr[0] * 0.4 + 180 * 0.6)),
+                    int(round(tracker_bgr[1] * 0.4 + 180 * 0.6)),
+                    int(round(tracker_bgr[2] * 0.4 + 180 * 0.6))
+                )
+                cv2.rectangle(frame_out, (s_box[0], s_box[1]), (s_box[2], s_box[3]), receiver_color, 1, cv2.LINE_AA)
                 
-            if is_possessor:
-                custom_name = name_mapping.get(str(tid))
-                display_name = custom_name if custom_name else f"Player {tid}"
-                draw_name_tag(frame, box[0], box[1], box[2], box[3], display_name, tracker_bgr)
+                rec_alpha = 1.0 - (future_k / 10.0)
+                draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name + " (REC)", receiver_color, alpha=rec_alpha)
+            elif tid in tag_decays:
+                alpha = tag_decays[tid]
+                draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name, tracker_bgr, alpha=alpha)
                 
         if ball_center is not None:
-            draw_tracker_ring(frame, ball_center[0], ball_center[1], tracker_bgr, radius=ball_radius)
+            draw_tracker_ring(frame_out, ball_center[0], ball_center[1], tracker_bgr, radius=ball_radius)
             
-        writer.write(frame)
+        writer.write(frame_out)
         frame_idx += 1
         
     cap.release()
