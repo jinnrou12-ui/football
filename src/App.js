@@ -82,11 +82,26 @@ function App() {
     showToast('Video loaded successfully.');
   };
 
-  // Open file picker to load a demo video from local system
+  // Programmatically load the sample match video from public folder to test the system
   const handleLoadSampleMatch = async (e) => {
     e.stopPropagation(); // prevent triggering upload-zone file dialog click
-    if (fileInputRef.current) {
-      fileInputRef.current.click();
+    try {
+      showToast('Downloading sample match video...');
+      const response = await fetch('/vdo football test.mp4');
+      if (!response.ok) throw new Error('Sample video not found in public folder');
+      const blob = await response.blob();
+      const sampleFile = new File([blob], 'vdo football test.mp4', { type: 'video/mp4' });
+      setFile(sampleFile);
+      setFileUrl(URL.createObjectURL(sampleFile));
+      setProcessedVideoUrl(null);
+      setJobId(null);
+      setJobStatus(null);
+      setProgress(0);
+      setPlayers([]);
+      showToast('Sample match video loaded.');
+    } catch (err) {
+      console.error(err);
+      showToast('Failed to load sample match: ' + err.message, 'error');
     }
   };
 
