@@ -452,7 +452,7 @@ class IoUTracker:
         # tracks: id -> {"box": (x1, y1, x2, y2), "lost_frames": int, "velocity": (vx, vy)}
         self.tracks = {}
 
-    def update(self, detections):
+    def update(self, detections, field_contour=None):
         # 1. Project all existing tracks using their velocity
         projected_boxes = {}
         for track_id, track_data in self.tracks.items():
@@ -460,6 +460,13 @@ class IoUTracker:
             vx, vy = track_data.get("velocity", (0.0, 0.0))
             proj_box = (box[0] + vx, box[1] + vy, box[2] + vx, box[3] + vy)
             projected_boxes[track_id] = proj_box
+            
+            # If the projected track's base/feet point is outside the pitch contour, kill the track instantly!
+            if field_contour is not None:
+                cx_feet = (proj_box[0] + proj_box[2]) / 2.0
+                cy_feet = proj_box[3]
+                if cv2.pointPolygonTest(field_contour, (cx_feet, cy_feet), False) < 0:
+                    track_data["lost_frames"] = self.max_lost_frames + 10  # Suppress / kill immediately
 
         # 2. Hungarian Bipartite Matching using scipy.optimize.linear_sum_assignment
         active_track_ids = [tid for tid, td in self.tracks.items() if td["lost_frames"] <= self.max_lost_frames]
@@ -515,6 +522,14 @@ class IoUTracker:
                             score += 0.3
                         # Hungarian cost: we want to maximize score, so cost is negative score
                         cost_matrix[i, j] = -score
+                        
+                        # Dense Crowding Re-ID Lock: Penalize sudden large acceleration changes (velocity jumps > 25px)
+                        # to prevent label transfers to static structures, goalposts, or goalkeepers.
+                        new_vx = det_cx - old_cx
+                        new_vy = det_cy - old_cy
+                        vel_change = math.sqrt((vx - new_vx)**2 + (vy - new_vy)**2)
+                        if vel_change > 25.0:
+                            cost_matrix[i, j] += vel_change * 5.0
             
             # Run Hungarian linear sum assignment
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
@@ -911,7 +926,7 @@ def process_video(job_id: str,
                         ball_candidates_small.append(((cx, cy), r, conf))
 
             # Update tracked players in 640x360
-            tracked_players_small = player_tracker.update(players_small)
+            tracked_players_small = player_tracker.update(players_small, field_contour=field_contour)
             raw_tracked_players_list.append(tracked_players_small)
 
             # Optical Flow on 640x360
@@ -986,7 +1001,10 @@ def process_video(job_id: str,
             current_radius = last_ball_radius
 
             if best_candidate is not None:
-                if not kf.initialized or high_conf_candidate is not None:
+                # Scale-Invariant Ball Alignment: if KF is not initialized, or we have high_conf_candidate,
+                # or there is a massive displacement (>50px) between detection and KF prediction with reasonable confidence (>0.25)
+                # indicating a scale transition/zoom, dynamically re-anchor by resetting the Kalman filter state!
+                if not kf.initialized or high_conf_candidate is not None or (kf_pred is not None and euclidean(best_candidate[0], best_candidate[1], kf_pred[0], kf_pred[1]) > 50.0 and best_score > 0.25):
                     # Reset/reinitialize Kalman Filter on high-confidence recalibration point
                     kf.initialize(best_candidate[0], best_candidate[1])
                     kf_x, kf_y = float(best_candidate[0]), float(best_candidate[1])
@@ -1031,11 +1049,16 @@ def process_video(job_id: str,
             if current_ball is not None and tracked_players_small:
                 bx, by = current_ball
                 min_dist = float("inf")
+                min_dist_center = float("inf")
                 closest_box = None
                 for track_id, (x1, y1, x2, y2) in tracked_players_small:
                     dist = dist_to_box(bx, by, x1, y1, x2, y2)
-                    if dist < min_dist:
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    dist_to_center = euclidean(bx, by, cx, cy)
+                    if (dist < min_dist) or (dist == min_dist and dist_to_center < min_dist_center):
                         min_dist = dist
+                        min_dist_center = dist_to_center
                         closest_box = (x1, y1, x2, y2)
                 if min_dist <= scaled_threshold:
                     last_active_player_box = closest_box
@@ -1064,12 +1087,17 @@ def process_video(job_id: str,
             if ball_center_small is not None and tracked_players_small:
                 bx, by = ball_center_small
                 min_dist = float("inf")
+                min_dist_center = float("inf")
                 closest_track_id = None
                 
                 for track_id, (x1, y1, x2, y2) in tracked_players_small:
                     dist = dist_to_box(bx, by, x1, y1, x2, y2)
-                    if dist < min_dist:
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    dist_to_center = euclidean(bx, by, cx, cy)
+                    if (dist < min_dist) or (dist == min_dist and dist_to_center < min_dist_center):
                         min_dist = dist
+                        min_dist_center = dist_to_center
                         closest_track_id = track_id
                         
                 if min_dist <= scaled_threshold:
