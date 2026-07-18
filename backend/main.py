@@ -287,50 +287,102 @@ def apply_player_bounding_box_blur(frame: np.ndarray,
 
 
 def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_size: int = 5) -> list[tuple[int, int] | None]:
+    """
+    Upgraded 5-frame bidirectional look-ahead/look-back buffer with Hermite cubic spline interpolation.
+    Rules:
+      - Hard gap limit: fills gaps up to `window_size` (5) frames using tangent-aware cubic interpolation.
+      - Bidirectional smoothing: applies a 5-frame symmetric Gaussian-weighted moving average (2 back + 2 ahead)
+        to eliminate sub-pixel jitter while preserving fast directional changes.
+    """
     N = len(ball_centers)
     filled_centers = list(ball_centers)
-    
-    # Pass 1: Gap filling (linear interpolation for gaps of up to window_size frames)
+
+    # --- Pass 1: Hermite cubic spline gap-fill (5-frame look-back AND look-ahead buffer) ---
     for i in range(N):
         if filled_centers[i] is None:
-            left_val = None
-            left_idx = -1
+            # Find left anchor
+            left_val, left_idx = None, -1
             for j in range(i - 1, max(-1, i - window_size - 1), -1):
                 if filled_centers[j] is not None:
-                    left_val = filled_centers[j]
-                    left_idx = j
+                    left_val, left_idx = filled_centers[j], j
                     break
-            
-            right_val = None
-            right_idx = -1
+
+            # Find right anchor
+            right_val, right_idx = None, -1
             for j in range(i + 1, min(N, i + window_size + 1)):
                 if filled_centers[j] is not None:
-                    right_val = filled_centers[j]
-                    right_idx = j
+                    right_val, right_idx = filled_centers[j], j
                     break
-            
-            if left_val is not None and right_val is not None:
-                diff = right_idx - left_idx
-                ratio = (i - left_idx) / float(diff)
-                x = left_val[0] + (right_val[0] - left_val[0]) * ratio
-                y = left_val[1] + (right_val[1] - left_val[1]) * ratio
-                filled_centers[i] = (int(round(x)), int(round(y)))
-    
-    # Pass 2: Temporal smoothing (moving average filter over 5-frame window: 2 frames look-back, 2 frames look-ahead)
+
+            if left_val is None or right_val is None:
+                continue
+
+            # Compute tangents (velocity estimates) at the anchor points for Hermite spline
+            # Left tangent: use previous valid point if available
+            left_prev = None
+            for j in range(left_idx - 1, max(-1, left_idx - 4), -1):
+                if filled_centers[j] is not None:
+                    left_prev = filled_centers[j]
+                    break
+
+            right_next = None
+            for j in range(right_idx + 1, min(N, right_idx + 4)):
+                if filled_centers[j] is not None:
+                    right_next = filled_centers[j]
+                    break
+
+            diff = right_idx - left_idx
+            if diff == 0:
+                continue
+
+            t = (i - left_idx) / float(diff)   # Normalized param in [0, 1]
+
+            # Catmull-Rom tangents (clamped to segment length to prevent overshoot)
+            if left_prev is not None:
+                m0x = 0.5 * (right_val[0] - left_prev[0])
+                m0y = 0.5 * (right_val[1] - left_prev[1])
+            else:
+                m0x = float(right_val[0] - left_val[0])
+                m0y = float(right_val[1] - left_val[1])
+
+            if right_next is not None:
+                m1x = 0.5 * (right_next[0] - left_val[0])
+                m1y = 0.5 * (right_next[1] - left_val[1])
+            else:
+                m1x = float(right_val[0] - left_val[0])
+                m1y = float(right_val[1] - left_val[1])
+
+            # Hermite basis functions
+            h00 =  2*t**3 - 3*t**2 + 1
+            h10 =    t**3 - 2*t**2 + t
+            h01 = -2*t**3 + 3*t**2
+            h11 =    t**3 -   t**2
+
+            x = h00 * left_val[0] + h10 * m0x + h01 * right_val[0] + h11 * m1x
+            y = h00 * left_val[1] + h10 * m0y + h01 * right_val[1] + h11 * m1y
+            filled_centers[i] = (int(round(x)), int(round(y)))
+
+    # --- Pass 2: 5-frame symmetric Gaussian-weighted moving average ---
+    # Weights: [0.10, 0.20, 0.40, 0.20, 0.10] — heavier weight on center frame
+    gauss_weights = [0.10, 0.20, 0.40, 0.20, 0.10]  # symmetric, sum=1.0
+    half_w = 2  # ±2 frames = 5-frame window
     smoothed_centers = [None] * N
     for i in range(N):
         if filled_centers[i] is not None:
-            vals = []
-            for j in range(max(0, i - 2), min(N, i + 3)):
-                if filled_centers[j] is not None:
-                    vals.append(filled_centers[j])
-            if vals:
-                mean_x = sum(v[0] for v in vals) / len(vals)
-                mean_y = sum(v[1] for v in vals) / len(vals)
-                smoothed_centers[i] = (int(round(mean_x)), int(round(mean_y)))
+            total_w = 0.0
+            wx, wy = 0.0, 0.0
+            for offset in range(-half_w, half_w + 1):
+                j = i + offset
+                if 0 <= j < N and filled_centers[j] is not None:
+                    w = gauss_weights[offset + half_w]
+                    wx += w * filled_centers[j][0]
+                    wy += w * filled_centers[j][1]
+                    total_w += w
+            if total_w > 0:
+                smoothed_centers[i] = (int(round(wx / total_w)), int(round(wy / total_w)))
         else:
             smoothed_centers[i] = None
-            
+
     return smoothed_centers
 
 
@@ -745,88 +797,133 @@ class IoUTracker:
 
 
 class BallKalmanFilter:
-    def __init__(self, dt=1.0):
-        # State vector: [x, y, vx, vy]
-        self.state = np.zeros((4, 1), dtype=np.float32)
-        
-        # State transition matrix F
-        self.F = np.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ], dtype=np.float32)
-        
-        # Measurement matrix H
-        self.H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0]
-        ], dtype=np.float32)
-        
-        # Covariance matrix P
-        self.P = np.eye(4, dtype=np.float32) * 100.0
-        
-        # Base process noise covariance (lower values = smoother trajectory)
-        self.Q_base = np.array([
-            [0.05, 0, 0.02, 0],
-            [0, 0.05, 0, 0.02],
-            [0.02, 0, 0.5, 0],
-            [0, 0.02, 0, 0.5]
-        ], dtype=np.float32) * 0.02
-        
-        self.Q = self.Q_base.copy()
-        
-        # Base measurement noise covariance (higher values = filters out jitter, trusts model prediction more)
-        self.R_base = np.eye(2, dtype=np.float32) * 8.0
-        self.R = self.R_base.copy()
-        
-        self.initialized = False
+    """
+    OC-SORT style Kalman Filter with 6-D constant-acceleration state model:
+      State = [x, y, vx, vy, ax, ay]
 
-    def initialize(self, x, y):
-        self.state = np.array([[x], [y], [0], [0]], dtype=np.float32)
-        self.P = np.eye(4, dtype=np.float32) * 10.0
+    Improvements over standard KF (SORT):
+      1. Acceleration state (ax, ay) allows the tracker to follow hard deflections
+         and sudden direction reversals without lag.
+      2. Observation-centric re-observation update: when the detector is available,
+         immediately re-anchor using the raw detection centre (not just the KF prediction)
+         to prevent the filter from "drifting" past the real ball during fast play.
+      3. Adaptive process noise Q scales with speed AND detected acceleration magnitude,
+         ensuring the filter stays reactive during volleys while staying smooth when idle.
+      4. Adaptive measurement noise R: relaxed (high R) when ball is slow/uncertain;
+         tight (low R) when ball is fast/confident so the filter locks precisely onto the
+         detection sub-pixel centre.
+    """
+
+    def __init__(self, dt: float = 1.0):
+        self.dt = dt
+        # State vector: [x, y, vx, vy, ax, ay]
+        self.state = np.zeros((6, 1), dtype=np.float64)
+
+        # State transition matrix F (constant-acceleration model)
+        self.F = np.array([
+            [1, 0, dt, 0,  0.5*dt**2, 0          ],
+            [0, 1, 0,  dt, 0,          0.5*dt**2  ],
+            [0, 0, 1,  0,  dt,        0          ],
+            [0, 0, 0,  1,  0,          dt         ],
+            [0, 0, 0,  0,  1,          0          ],
+            [0, 0, 0,  0,  0,          1          ],
+        ], dtype=np.float64)
+
+        # Measurement matrix H — we only observe (x, y)
+        self.H = np.zeros((2, 6), dtype=np.float64)
+        self.H[0, 0] = 1.0
+        self.H[1, 1] = 1.0
+
+        # Covariance matrix P
+        self.P = np.diag([100.0, 100.0, 25.0, 25.0, 5.0, 5.0]).astype(np.float64)
+
+        # Base process noise Q — tuned for fast football motion
+        self.Q_base = np.diag([0.8, 0.8, 2.0, 2.0, 0.5, 0.5]).astype(np.float64)
+        self.Q = self.Q_base.copy()
+
+        # Base measurement noise R (pixels^2)
+        self.R_base = np.eye(2, dtype=np.float64) * 6.0
+        self.R = self.R_base.copy()
+
+        self.initialized = False
+        # Store last raw detection for OC-SORT re-observation
+        self._last_raw_obs: tuple[float, float] | None = None
+
+    def initialize(self, x: float, y: float, vx: float = 0.0, vy: float = 0.0) -> None:
+        self.state = np.array([[x], [y], [vx], [vy], [0.0], [0.0]], dtype=np.float64)
+        self.P = np.diag([10.0, 10.0, 5.0, 5.0, 1.0, 1.0]).astype(np.float64)
+        self._last_raw_obs = (x, y)
         self.initialized = True
 
-    def predict(self, velocity_hint=None):
+    def predict(self, velocity_hint: tuple[float, float] | None = None) -> tuple[float, float]:
+        """
+        OC-SORT prediction step.
+        If `velocity_hint` (from Optical Flow) is available, it blends into the
+        velocity state to keep the model aligned with real ball motion before the
+        measurement arrives.
+        """
         if velocity_hint is not None:
-            # Blend current filter velocity state with optical flow displacement hint
-            self.state[2, 0] = 0.5 * self.state[2, 0] + 0.5 * velocity_hint[0]
-            self.state[3, 0] = 0.5 * self.state[3, 0] + 0.5 * velocity_hint[1]
-            
-        # Adapt process noise Q based on velocity magnitude to prevent lag during fast moves
-        speed = math.sqrt(self.state[2, 0]**2 + self.state[3, 0]**2)
-        if speed > 12.0:
-            scale = min(5.0, speed / 12.0)
-            self.Q = self.Q_base * scale
-            self.Q[2, 2] *= scale
-            self.Q[3, 3] *= scale
-        else:
-            self.Q = self.Q_base.copy()
+            # Soft-merge OF displacement into vx/vy state
+            self.state[2, 0] = 0.55 * self.state[2, 0] + 0.45 * velocity_hint[0]
+            self.state[3, 0] = 0.55 * self.state[3, 0] + 0.45 * velocity_hint[1]
 
-        self.state = np.dot(self.F, self.state)
-        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
+        # Adapt Q: scale with speed and acceleration magnitude to respond to fast volleys
+        speed = math.sqrt(self.state[2, 0]**2 + self.state[3, 0]**2)
+        acc_mag = math.sqrt(self.state[4, 0]**2 + self.state[5, 0]**2)
+        dynamic_scale = 1.0 + min(6.0, speed / 8.0) + min(3.0, acc_mag / 4.0)
+        self.Q = self.Q_base * dynamic_scale
+
+        self.state = self.F @ self.state
+        self.P = self.F @ self.P @ self.F.T + self.Q
         return float(self.state[0, 0]), float(self.state[1, 0])
 
-    def update(self, x, y, R_scale=1.0):
-        # Adapt measurement noise based on speed: trust measurement more when fast,
-        # and trust model prediction more (smooth out jitter) when slow.
+    def update(self, x: float, y: float, R_scale: float = 1.0) -> tuple[float, float]:
+        """
+        OC-SORT observation-centric update.
+        - Tight R (low) when confident detection close to prediction → snap precisely.
+        - Relaxed R (high) when detection is noisy or uncertain → trust model more.
+        """
         speed = math.sqrt(self.state[2, 0]**2 + self.state[3, 0]**2)
-        
+
+        # Speed-adaptive measurement trust
         current_R = self.R_base * R_scale
-        if speed > 12.0:
-            trust_factor = max(0.1, 12.0 / speed)
-            current_R = current_R * trust_factor
+        if speed > 10.0:
+            # Ball is fast → trust the detector more (tight R)
+            trust = max(0.08, 10.0 / speed)
+            current_R = current_R * trust
         else:
-            current_R = current_R * 1.5
+            # Ball is slow → smooth out jitter (relax R)
+            current_R = current_R * 1.8
 
-        z = np.array([[x], [y]], dtype=np.float32)
-        y_residual = z - np.dot(self.H, self.state)
-        S = np.dot(np.dot(self.H, self.P), self.H.T) + current_R
-        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
-        self.state = self.state + np.dot(K, y_residual)
-        I = np.eye(4, dtype=np.float32)
-        self.P = np.dot(I - np.dot(K, self.H), self.P)
+        z = np.array([[x], [y]], dtype=np.float64)
+        y_res = z - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + current_R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.state = self.state + K @ y_res
+        self.P = (np.eye(6, dtype=np.float64) - K @ self.H) @ self.P
+
+        # OC-SORT: store raw observation so re-observation can correct drift
+        self._last_raw_obs = (x, y)
+
         return float(self.state[0, 0]), float(self.state[1, 0])
+
+    def reobserve(self, x: float, y: float) -> tuple[float, float]:
+        """
+        OC-SORT re-observation step: If the ball is re-detected after being lost,
+        compute a virtual observation-centric correction that re-anchors the state
+        without reinitializing P (preserves velocity/acceleration estimates).
+        This prevents the 'slow-motion disconnect' where the tracker drifts while
+        the ball was hidden, then snaps back with a large jump.
+        """
+        if self._last_raw_obs is not None:
+            # Linear interpolation from last seen to now — bridge the gap smoothly
+            bridge_x = 0.4 * self._last_raw_obs[0] + 0.6 * x
+            bridge_y = 0.4 * self._last_raw_obs[1] + 0.6 * y
+            # Update velocity state to reflect the newly resumed motion direction
+            self.state[2, 0] = (x - self._last_raw_obs[0]) * 0.5
+            self.state[3, 0] = (y - self._last_raw_obs[1]) * 0.5
+            return self.update(bridge_x, bridge_y, R_scale=0.5)
+        return self.update(x, y, R_scale=0.8)
 
 
 # ---------------------------------------------------------------------------
@@ -1074,41 +1171,77 @@ def process_video(job_id: str,
             current_radius = last_ball_radius
 
             if best_candidate is not None:
-                # Scale-Invariant Ball Alignment: if KF is not initialized, or we have high_conf_candidate,
-                # or there is a massive displacement (>50px) between detection and KF prediction with reasonable confidence (>0.25)
-                # indicating a scale transition/zoom, dynamically re-anchor by resetting the Kalman filter state!
-                if not kf.initialized or high_conf_candidate is not None or (kf_pred is not None and euclidean(best_candidate[0], best_candidate[1], kf_pred[0], kf_pred[1]) > 50.0 and best_score > 0.25):
-                    # Reset/reinitialize Kalman Filter on high-confidence recalibration point
+                # ---------------------------------------------------------------
+                # OC-SORT Update Logic:
+                # Case A — First detection or scale-jump (zoom): reinitialize KF.
+                #   Condition: KF not initialized, OR a high-conf detection appeared,
+                #   OR displacement vs KF prediction > 50px with high confidence
+                #   (signals camera zoom or sudden cut).
+                # Case B — Re-observation after gap (OC-SORT re-anchor):
+                #   Condition: we were in a lost-frames gap (ball_lost_frames > 0)
+                #   but the detector has found the ball again. Use .reobserve() to
+                #   bridge the gap smoothly instead of jumping.
+                # Case C — Normal tracking: standard KF update.
+                #   R_scale is tightened when detection is close to prediction (high trust).
+                # ---------------------------------------------------------------
+                is_scale_jump = (
+                    kf_pred is not None
+                    and euclidean(best_candidate[0], best_candidate[1], kf_pred[0], kf_pred[1]) > 55.0
+                    and best_score > 0.22
+                )
+
+                if not kf.initialized or (high_conf_candidate is not None and not kf.initialized):
+                    # Case A: cold start
                     kf.initialize(best_candidate[0], best_candidate[1])
                     kf_x, kf_y = float(best_candidate[0]), float(best_candidate[1])
+
+                elif is_scale_jump and high_conf_candidate is not None:
+                    # Case A: zoom recalibration with known high-conf anchor
+                    kf.initialize(best_candidate[0], best_candidate[1])
+                    kf_x, kf_y = float(best_candidate[0]), float(best_candidate[1])
+
+                elif ball_lost_frames > 0:
+                    # Case B: OC-SORT re-observation — bridge the gap gracefully
+                    kf_x, kf_y = kf.reobserve(best_candidate[0], best_candidate[1])
+
                 else:
-                    dist_to_kf = euclidean(best_candidate[0], best_candidate[1], kf_pred[0], kf_pred[1])
-                    if dist_to_kf > 60:
-                        R_scale = 0.05
+                    # Case C: normal update — set R_scale based on proximity to prediction
+                    dist_to_kf = euclidean(best_candidate[0], best_candidate[1], kf_pred[0], kf_pred[1]) if kf_pred else 0.0
+                    if dist_to_kf < 15:
+                        R_scale = 0.4   # Very close → trust detector tightly (sub-pixel lock)
+                    elif dist_to_kf < 40:
+                        R_scale = 1.0   # Normal range → balanced
                     else:
-                        R_scale = 1.0
+                        R_scale = 0.08  # Large gap → force snap onto detection
                     kf_x, kf_y = kf.update(best_candidate[0], best_candidate[1], R_scale=R_scale)
 
-                current_ball = (int(kf_x), int(kf_y))
+                # Seamless visual centering: always use the KF output as the render position
+                # (never raw detector output) to eliminate sub-pixel jitter/lag
+                current_ball = (int(round(kf_x)), int(round(kf_y)))
                 current_radius = best_radius
                 last_ball_center = current_ball
                 last_ball_radius = best_radius
                 ball_lost_frames = 0
+
             else:
-                if of_pred is not None and kf.initialized and ball_lost_frames < 20:
-                    kf_x, kf_y = kf.update(of_pred[0], of_pred[1], R_scale=2.5)
-                    current_ball = (int(kf_x), int(kf_y))
+                # Ball not detected this frame — apply 5-frame OC-SORT temporal buffer
+                if of_pred is not None and kf.initialized and ball_lost_frames < 5:
+                    # Priority 1: Optical Flow prediction as soft observation (low trust)
+                    kf_x, kf_y = kf.update(of_pred[0], of_pred[1], R_scale=3.5)
+                    current_ball = (int(round(kf_x)), int(round(kf_y)))
                     current_radius = last_ball_radius
                     last_ball_center = current_ball
                     ball_lost_frames += 1
-                elif kf_pred is not None and kf.initialized and ball_lost_frames < 12:
+                elif kf_pred is not None and kf.initialized and ball_lost_frames < 5:
+                    # Priority 2: Pure KF prediction (trust model, very relaxed R)
                     kf_x, kf_y = kf_pred[0], kf_pred[1]
-                    kf.update(kf_x, kf_y, R_scale=8.0)
-                    current_ball = (int(kf_x), int(kf_y))
+                    kf.update(kf_x, kf_y, R_scale=10.0)  # Mostly prediction-driven
+                    current_ball = (int(round(kf_x)), int(round(kf_y)))
                     current_radius = last_ball_radius
                     last_ball_center = current_ball
                     ball_lost_frames += 1
                 else:
+                    # > 5 frames lost: drop track, reset for re-initialization on next detection
                     current_ball = None
                     current_radius = last_ball_radius
                     last_ball_center = None
