@@ -339,7 +339,7 @@ def draw_name_tag_with_alpha(frame: np.ndarray, x1: int, y1: int, x2: int, y2: i
 
 
 class IoUTracker:
-    def __init__(self, iou_threshold=0.25, max_lost_frames=30, max_render_lost_frames=10):
+    def __init__(self, iou_threshold=0.50, max_lost_frames=60, max_render_lost_frames=20):
         self.iou_threshold = iou_threshold
         self.max_lost_frames = max_lost_frames
         self.max_render_lost_frames = max_render_lost_frames
@@ -373,8 +373,8 @@ class IoUTracker:
             vx, vy = track_data.get("velocity", (0.0, 0.0))
             track_speed = math.sqrt(vx**2 + vy**2)
             
-            # Dynamic matching distance based on speed
-            max_match_dist = 45.0 + 2.0 * track_speed
+            # Dynamic matching distance based on speed (X2 Boost)
+            max_match_dist = 90.0 + 4.0 * track_speed
             
             for det_idx, det in enumerate(detections):
                 iou = self.calculate_iou(proj_box, det)
@@ -732,8 +732,8 @@ def process_video(job_id: str,
                 
             frame_small = cv2.resize(frame, (640, 360))
             
-            # YOLO inference on 640x360 frame
-            results = model(frame_small, conf=0.1, verbose=False)[0]
+            # YOLO inference on 640x360 frame (lower conf threshold to 0.05 for x2 boost and zero dropouts)
+            results = model(frame_small, conf=0.05, verbose=False)[0]
 
             players_small = []
             ball_candidates_small = []
@@ -743,7 +743,7 @@ def process_video(job_id: str,
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                if cls_id == 0 and conf > 0.35:          # player
+                if cls_id == 0 and conf > 0.15:          # player (lower threshold strictly for active players / overall tracking boost)
                     players_small.append((x1, y1, x2, y2))
                 elif cls_id == 32:                       # ball
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -802,7 +802,7 @@ def process_video(job_id: str,
                             best_candidate = (cx, cy)
                             best_radius = r
                 else:
-                    if conf > 0.25:
+                    if conf > 0.05:
                         if conf > best_score:
                             best_score = conf
                             best_candidate = (cx, cy)
