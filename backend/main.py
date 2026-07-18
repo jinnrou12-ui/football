@@ -202,7 +202,7 @@ def apply_player_bounding_box_blur(frame: np.ndarray,
     return frame_out
 
 
-def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_size: int = 5) -> list[tuple[int, int] | None]:
+def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_size: int = 10) -> list[tuple[int, int] | None]:
     N = len(ball_centers)
     filled_centers = list(ball_centers)
     
@@ -232,12 +232,12 @@ def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_si
                 y = left_val[1] + (right_val[1] - left_val[1]) * ratio
                 filled_centers[i] = (int(round(x)), int(round(y)))
     
-    # Pass 2: Temporal smoothing (moving average filter)
+    # Pass 2: Temporal smoothing (moving average filter over 10-frame window)
     smoothed_centers = [None] * N
     for i in range(N):
         if filled_centers[i] is not None:
             vals = []
-            for j in range(max(0, i - 2), min(N, i + 3)):
+            for j in range(max(0, i - 5), min(N, i + 6)):
                 if filled_centers[j] is not None:
                     vals.append(filled_centers[j])
             if vals:
@@ -248,6 +248,79 @@ def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_si
             smoothed_centers[i] = None
             
     return smoothed_centers
+
+
+def smooth_player_trajectories(raw_tracked_players_list: list[list[tuple[int, list[int]]]], window_size: int = 10) -> list[list[tuple[int, list[int]]]]:
+    # 1. Identify all unique track IDs and construct their trajectories
+    num_frames = len(raw_tracked_players_list)
+    trajectories = {}  # track_id -> list of (x1, y1, x2, y2) or None of length num_frames
+    
+    for f_idx in range(num_frames):
+        for track_id, box in raw_tracked_players_list[f_idx]:
+            if track_id not in trajectories:
+                trajectories[track_id] = [None] * num_frames
+            trajectories[track_id][f_idx] = tuple(box)
+            
+    # 2. Smooth and gap fill each player trajectory
+    for track_id, boxes in trajectories.items():
+        # Gap filling (linear interpolation for gaps of up to window_size frames)
+        filled = list(boxes)
+        for i in range(num_frames):
+            if filled[i] is None:
+                # Find left neighbor
+                left_val = None
+                left_idx = -1
+                for j in range(i - 1, max(-1, i - window_size - 1), -1):
+                    if filled[j] is not None:
+                        left_val = filled[j]
+                        left_idx = j
+                        break
+                
+                # Find right neighbor
+                right_val = None
+                right_idx = -1
+                for j in range(i + 1, min(num_frames, i + window_size + 1)):
+                    if filled[j] is not None:
+                        right_val = filled[j]
+                        right_idx = j
+                        break
+                
+                if left_val is not None and right_val is not None:
+                    diff = right_idx - left_idx
+                    ratio = (i - left_idx) / float(diff)
+                    x1 = left_val[0] + (right_val[0] - left_val[0]) * ratio
+                    y1 = left_val[1] + (right_val[1] - left_val[1]) * ratio
+                    x2 = left_val[2] + (right_val[2] - left_val[2]) * ratio
+                    y2 = left_val[3] + (right_val[3] - left_val[3]) * ratio
+                    filled[i] = (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
+                    
+        # Temporal smoothing (10-frame moving average: 5 frames look-back, 5 frames look-ahead)
+        smoothed = [None] * num_frames
+        for i in range(num_frames):
+            if filled[i] is not None:
+                vals = []
+                for j in range(max(0, i - 5), min(num_frames, i + 6)):
+                    if filled[j] is not None:
+                        vals.append(filled[j])
+                if vals:
+                    m_x1 = sum(v[0] for v in vals) / len(vals)
+                    m_y1 = sum(v[1] for v in vals) / len(vals)
+                    m_x2 = sum(v[2] for v in vals) / len(vals)
+                    m_y2 = sum(v[3] for v in vals) / len(vals)
+                    smoothed[i] = [int(round(m_x1)), int(round(m_y1)), int(round(m_x2)), int(round(m_y2))]
+            else:
+                smoothed[i] = None
+        trajectories[track_id] = smoothed
+
+    # 3. Reconstruct raw_tracked_players_list from smoothed trajectories
+    smoothed_list = [[] for _ in range(num_frames)]
+    for track_id, trajectory in trajectories.items():
+        for f_idx in range(num_frames):
+            box = trajectory[f_idx]
+            if box is not None:
+                smoothed_list[f_idx].append((track_id, box))
+                
+    return smoothed_list
 
 
 def draw_name_tag(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, name: str, tracker_color: tuple[int, int, int]) -> None:
@@ -907,8 +980,9 @@ def process_video(job_id: str,
             if total > 0:
                 jobs[job_id]["progress"] = int(frame_idx / total * 50)
 
-        # Pass 2: Temporal Smoothing & Gap Filling (5-frame look-ahead/look-back sliding window)
-        smoothed_ball_centers = smooth_ball_trajectory(raw_ball_centers, window_size=5)
+        # Pass 2: Temporal Smoothing & Gap Filling (10-frame look-ahead/look-back sliding window)
+        smoothed_ball_centers = smooth_ball_trajectory(raw_ball_centers, window_size=10)
+        raw_tracked_players_list = smooth_player_trajectories(raw_tracked_players_list, window_size=10)
 
         # Pass 2.5: Precalculate possession & 10-frame look-ahead for all frames
         raw_possessor_ids = []
