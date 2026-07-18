@@ -171,6 +171,60 @@ def draw_tracker_ring(frame: np.ndarray,
     cv2.circle(frame, (cx, cy), dot_radius, color, -1, cv2.LINE_AA)
 
 
+def draw_ball_trajectory(frame: np.ndarray,
+                         smoothed_centers: list[tuple[int, int] | None],
+                         current_frame_idx: int,
+                         color: tuple[int, int, int],
+                         x_scale: float,
+                         y_scale: float,
+                         max_points: int = 25) -> None:
+    """
+    Draws a smooth, fading trajectory curve of the ball's movement history
+    up to the current frame index on the high-resolution frame.
+    """
+    points = []
+    start_idx = max(0, current_frame_idx - max_points + 1)
+    for idx in range(start_idx, current_frame_idx + 1):
+        pt = smoothed_centers[idx]
+        if pt is not None:
+            px = int(round(pt[0] * x_scale))
+            py = int(round(pt[1] * y_scale))
+            points.append((px, py))
+            
+    if len(points) < 2:
+        return
+        
+    # Find bounding box of the entire trajectory points to minimize blending area
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    min_x, max_x = max(0, min(xs) - 10), min(frame.shape[1] - 1, max(xs) + 10)
+    min_y, max_y = max(0, min(ys) - 10), min(frame.shape[0] - 1, max(ys) + 10)
+    
+    if max_x <= min_x or max_y <= min_y:
+        return
+        
+    # Extract ROI
+    roi = frame[min_y:max_y, min_x:max_x].copy()
+    
+    # Draw segments on ROI with fading alpha
+    num_segments = len(points) - 1
+    for i in range(num_segments):
+        # Coordinates relative to ROI
+        pt1 = (points[i][0] - min_x, points[i][1] - min_y)
+        pt2 = (points[i+1][0] - min_x, points[i+1][1] - min_y)
+        
+        alpha = (i + 1) / float(num_segments)
+        thickness = max(2, int(5 * alpha))
+        
+        # Blend segment with transparency
+        segment_roi = roi.copy()
+        cv2.line(segment_roi, pt1, pt2, color, thickness, cv2.LINE_AA)
+        cv2.addWeighted(segment_roi, alpha * 0.75, roi, 1.0 - alpha * 0.75, 0, roi)
+        
+    # Write blended ROI back to the frame
+    frame[min_y:max_y, min_x:max_x] = roi
+
+
 def apply_possession_highlight(frame: np.ndarray,
                                 x1: int, y1: int, x2: int, y2: int,
                                 color: tuple[int, int, int]) -> None:
@@ -359,13 +413,13 @@ def draw_name_tag(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, name: s
     cy = y1 - 10  # Positioned slightly above the player's head
     
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
+    font_scale = 0.55
     thickness = 2
     text_size = cv2.getTextSize(name.upper(), font, font_scale, thickness)[0]
     tw, th = text_size[0], text_size[1]
     
-    padding_x = 8
-    padding_y = 5
+    padding_x = 10
+    padding_y = 6
     pill_w = tw + 2 * padding_x
     pill_h = th + 2 * padding_y
     
@@ -375,24 +429,40 @@ def draw_name_tag(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, name: s
     pill_y2 = cy - 10
     
     h_f, w_f = frame.shape[:2]
+    # Bound check
+    if pill_x1 < 0:
+        pill_x2 -= pill_x1
+        pill_x1 = 0
+    if pill_x2 >= w_f:
+        pill_x1 -= (pill_x2 - w_f + 1)
+        pill_x2 = w_f - 1
     if pill_y1 < 0:
         shift = -pill_y1 + 5
         pill_y1 += shift
         pill_y2 += shift
         cy += shift
 
-    # Draw the pointer triangle pointing down
+    # Draw the pointer triangle pointing down with the selected tracker color (with anti-aliasing)
     pts = np.array([[cx, cy], [cx - 6, cy - 10], [cx + 6, cy - 10]], np.int32)
     cv2.drawContours(frame, [pts], 0, tracker_color, -1, cv2.LINE_AA)
     
-    # Draw the pill background (dark grey/black with a light border)
-    bg_color = (25, 25, 25)
-    border_color = (200, 200, 200)
-    
-    cv2.rectangle(frame, (pill_x1, pill_y1), (pill_x2, pill_y2), bg_color, -1, cv2.LINE_AA)
-    cv2.rectangle(frame, (pill_x1, pill_y1), (pill_x2, pill_y2), border_color, 1, cv2.LINE_AA)
-    
-    # Draw text (white, bold uppercase)
+    # Extract name tag ROI for semi-transparent pill drawing
+    rx1, ry1 = max(0, pill_x1), max(0, pill_y1)
+    rx2, ry2 = min(w_f - 1, pill_x2), min(h_f - 1, pill_y2)
+    if rx2 > rx1 and ry2 > ry1:
+        roi = frame[ry1:ry2, rx1:rx2].copy()
+        
+        # Draw background pill with dark color (semi-transparent black)
+        bg_color = (15, 15, 15)
+        # Draw rounded rectangle / pill
+        cv2.rectangle(roi, (0, 0), (rx2 - rx1, ry2 - ry1), bg_color, -1, cv2.LINE_AA)
+        # Thin border matching tracker color for premium identity look
+        cv2.rectangle(roi, (0, 0), (rx2 - rx1, ry2 - ry1), tracker_color, 1, cv2.LINE_AA)
+        
+        # Blend ROI with original frame to get 80% opacity pill
+        cv2.addWeighted(roi, 0.82, frame[ry1:ry2, rx1:rx2], 0.18, 0, frame[ry1:ry2, rx1:rx2])
+        
+    # Draw text on top (white, bold uppercase)
     tx = pill_x1 + padding_x
     ty = pill_y2 - padding_y
     cv2.putText(frame, name.upper(), (tx, ty), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
@@ -1345,6 +1415,9 @@ def process_video(job_id: str,
                     
                     apply_possession_highlight(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], tracker_bgr)
                     draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name, tracker_bgr, alpha=1.0)
+
+            # Draw ball trajectory curve (upscaled)
+            draw_ball_trajectory(frame_out, smoothed_ball_centers, frame_idx, tracker_bgr, x_scale, y_scale, max_points=25)
 
             # Draw ball tracker ring (upscaled)
             if ball_center_small is not None:
