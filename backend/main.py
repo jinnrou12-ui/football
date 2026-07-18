@@ -78,15 +78,20 @@ THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 # YOLOv8 model (loaded once at startup)
 # ---------------------------------------------------------------------------
-MODEL_PATH = "yolov8s.pt"   # Upgraded to YOLOv8s for much better sports ball detection
+MODEL_PATH = "yolo11x.pt"   # Upgraded to YOLOv11x (Extra Large) for high-speed small object detection
 model: YOLO | None = None
 
 @app.on_event("startup")
 async def load_model():
     global model
-    print("[Startup] Loading YOLOv8 model (yolov8s) …")
-    model = YOLO(MODEL_PATH)
-    print("[Startup] YOLOv8 model ready.")
+    print("[Startup] Loading YOLOv11x (Extra Large) model …")
+    try:
+        model = YOLO(MODEL_PATH)
+        print("[Startup] YOLOv11x model ready.")
+    except Exception as e:
+        print(f"[Startup] Failed to load {MODEL_PATH} ({e}). Falling back to yolov8s.pt …")
+        model = YOLO("yolov8s.pt")
+        print("[Startup] Fallback YOLOv8s model ready.")
 
 # ---------------------------------------------------------------------------
 # In-memory job tracker  {job_id: {"status": str, "filename": str | None}}
@@ -202,7 +207,7 @@ def apply_player_bounding_box_blur(frame: np.ndarray,
     return frame_out
 
 
-def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_size: int = 10) -> list[tuple[int, int] | None]:
+def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_size: int = 5) -> list[tuple[int, int] | None]:
     N = len(ball_centers)
     filled_centers = list(ball_centers)
     
@@ -232,12 +237,12 @@ def smooth_ball_trajectory(ball_centers: list[tuple[int, int] | None], window_si
                 y = left_val[1] + (right_val[1] - left_val[1]) * ratio
                 filled_centers[i] = (int(round(x)), int(round(y)))
     
-    # Pass 2: Temporal smoothing (moving average filter over 10-frame window)
+    # Pass 2: Temporal smoothing (moving average filter over 5-frame window: 2 frames look-back, 2 frames look-ahead)
     smoothed_centers = [None] * N
     for i in range(N):
         if filled_centers[i] is not None:
             vals = []
-            for j in range(max(0, i - 5), min(N, i + 6)):
+            for j in range(max(0, i - 2), min(N, i + 3)):
                 if filled_centers[j] is not None:
                     vals.append(filled_centers[j])
             if vals:
@@ -980,8 +985,8 @@ def process_video(job_id: str,
             if total > 0:
                 jobs[job_id]["progress"] = int(frame_idx / total * 50)
 
-        # Pass 2: Temporal Smoothing & Gap Filling (10-frame look-ahead/look-back sliding window)
-        smoothed_ball_centers = smooth_ball_trajectory(raw_ball_centers, window_size=10)
+        # Pass 2: Temporal Smoothing & Gap Filling (5-frame look-ahead/look-back sliding window for ball)
+        smoothed_ball_centers = smooth_ball_trajectory(raw_ball_centers, window_size=5)
         raw_tracked_players_list = smooth_player_trajectories(raw_tracked_players_list, window_size=10)
 
         # Pass 2.5: Precalculate possession & 10-frame look-ahead for all frames
@@ -1163,33 +1168,12 @@ def process_video(job_id: str,
                             crowded_players.add(tid1)
                             crowded_players.add(tid2)
 
-            # Update blur alpha factors (smooth transition: 0.1s duration)
+            # Update blur alpha factors (possession-based inverse blur: active possessor unblurred, off-ball players blurred)
             for track_id, box in tracked_players_small:
-                target_alpha = 1.0
-                
                 if possessor_track_id is not None and track_id == possessor_track_id:
                     target_alpha = 0.0
-                elif future_tid is not None and track_id == future_tid and future_k <= 10:
-                    # Smoothly transition blur to 0.0 as ball approaches receiver
-                    target_alpha = max(0.0, (future_k - 1) / 10.0)
-                elif track_id in crowded_players:
-                    # Prevent blurring crowded players/crossovers
-                    target_alpha = 0.0
                 else:
-                    # Multi-player occlusion: prevent blurring players close to or overlapping with focus
-                    if possessor_box_small is not None:
-                        overlap = get_box_overlap(box, possessor_box_small)
-                        box_area = (box[2] - box[0]) * (box[3] - box[1])
-                        overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
-                        if overlap_ratio >= 0.15:
-                            target_alpha = 0.0
-                    
-                    if target_alpha > 0.0 and future_box_small is not None:
-                        overlap = get_box_overlap(box, future_box_small)
-                        box_area = (box[2] - box[0]) * (box[3] - box[1])
-                        overlap_ratio = overlap / float(box_area) if box_area > 0 else 0
-                        if overlap_ratio >= 0.15:
-                            target_alpha = 0.0
+                    target_alpha = 1.0
 
                 current_alpha = blur_factors.get(track_id, 1.0)
                 if current_alpha < target_alpha:
@@ -1233,38 +1217,21 @@ def process_video(job_id: str,
             # Apply Gaussian blur exclusively to off-ball player bounding boxes
             frame_out = apply_player_bounding_box_blur(frame, tracked_players_small, blur_factors, x_scale, y_scale)
 
-            # Draw the possession highlight and name tag (using upscaled smoothed coordinates)
-            for track_id, box, role in highlight_players:
-                s_box_small = smoothed_boxes.get(track_id)
-                if s_box_small is None:
-                    continue
-                s_box = [
-                    int(round(s_box_small[0] * x_scale)),
-                    int(round(s_box_small[1] * y_scale)),
-                    int(round(s_box_small[2] * x_scale)),
-                    int(round(s_box_small[3] * y_scale)),
-                ]
-                custom_name = name_mapping.get(str(track_id))
-                display_name = custom_name if custom_name else f"Player {track_id}"
-                
-                if role == "possessor":
+            # Draw the possession highlight and name tag (possessor only, disappears instantly)
+            if possessor_track_id is not None:
+                s_box_small = smoothed_boxes.get(possessor_track_id)
+                if s_box_small is not None:
+                    s_box = [
+                        int(round(s_box_small[0] * x_scale)),
+                        int(round(s_box_small[1] * y_scale)),
+                        int(round(s_box_small[2] * x_scale)),
+                        int(round(s_box_small[3] * y_scale)),
+                    ]
+                    custom_name = name_mapping.get(str(possessor_track_id))
+                    display_name = custom_name if custom_name else f"Player {possessor_track_id}"
+                    
                     apply_possession_highlight(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], tracker_bgr)
                     draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name, tracker_bgr, alpha=1.0)
-                elif role == "receiver":
-                    # Blend tracker_bgr with light grey/white for receiver highlight
-                    receiver_color = (
-                        int(round(tracker_bgr[0] * 0.4 + 180 * 0.6)),
-                        int(round(tracker_bgr[1] * 0.4 + 180 * 0.6)),
-                        int(round(tracker_bgr[2] * 0.4 + 180 * 0.6))
-                    )
-                    # Bounding boxes completely disabled as per user instruction
-                    # cv2.rectangle(frame_out, (s_box[0], s_box[1]), (s_box[2], s_box[3]), receiver_color, 1, cv2.LINE_AA)
-                    
-                    rec_alpha = 1.0 - (future_k / 10.0)
-                    draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name + " (REC)", receiver_color, alpha=rec_alpha)
-                elif track_id in tag_decays:
-                    alpha = tag_decays[track_id]
-                    draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name, tracker_bgr, alpha=alpha)
 
             # Draw ball tracker ring (upscaled)
             if ball_center_small is not None:
