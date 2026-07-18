@@ -121,29 +121,27 @@ def dist_to_box(bx: float, by: float, x1: float, y1: float, x2: float, y2: float
     return euclidean(bx, by, cx, cy)
 
 def get_field_contour(frame_small: np.ndarray) -> np.ndarray | None:
-    # Convert to HSV color space
+    """
+    Detect the green football pitch contour via HSV green masking.
+    Returns the largest green contour if it covers >= 15% of the frame,
+    otherwise returns None so callers fall back to accepting all detections.
+    Tries two HSV green ranges for robustness under shadow / stadium lighting.
+    """
     hsv = cv2.cvtColor(frame_small, cv2.COLOR_BGR2HSV)
-    
-    # Define green color range for football pitch (broad green range adapting to shadow/sun)
-    lower_green = np.array([30, 30, 30])
-    upper_green = np.array([85, 255, 255])
-    
-    # Create mask and apply morphological operations to clean up
-    mask = cv2.inRange(hsv, lower_green, upper_green)
-    
-    # Fill in holes (morphological close/open)
+
+    # Primary green range (daylight)
+    mask = cv2.inRange(hsv, np.array([28, 25, 25]), np.array([90, 255, 255]))
+
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    
-    # Find contours
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    frame_area = frame_small.shape[0] * frame_small.shape[1]
     if contours:
-        # Return the contour with the largest area (the pitch)
-        largest_contour = max(contours, key=cv2.contourArea)
-        # Only accept if it takes a reasonable portion of the frame
-        if cv2.contourArea(largest_contour) > (frame_small.shape[0] * frame_small.shape[1] * 0.15):
-            return largest_contour
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) > frame_area * 0.15:
+            return cv2.convexHull(largest)   # Use convex hull for more stable boundary
     return None
 
 
@@ -461,11 +459,14 @@ class IoUTracker:
             proj_box = (box[0] + vx, box[1] + vy, box[2] + vx, box[3] + vy)
             projected_boxes[track_id] = proj_box
             
-            # If the projected track's base/feet point is outside the pitch contour, kill the track instantly!
+            # Context-Aware Field Contouring: if the track's feet drift outside the playable pitch,
+            # immediately mark it as dead so it won't render or receive new assignments.
             if field_contour is not None:
                 cx_feet = (proj_box[0] + proj_box[2]) / 2.0
-                cy_feet = proj_box[3]
-                if cv2.pointPolygonTest(field_contour, (cx_feet, cy_feet), False) < 0:
+                # Use the bottom-third midpoint (more robust than very bottom edge)
+                cy_feet = proj_box[1] + (proj_box[3] - proj_box[1]) * 0.75
+                # pointPolygonTest returns negative for outside; use signed distance check
+                if cv2.pointPolygonTest(field_contour, (float(cx_feet), float(cy_feet)), False) < 0:
                     track_data["lost_frames"] = self.max_lost_frames + 10  # Suppress / kill immediately
 
         # 2. Hungarian Bipartite Matching using scipy.optimize.linear_sum_assignment
@@ -874,18 +875,21 @@ def process_video(job_id: str,
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
                 if cls_id == 0:
-                    # Context-Aware Background Noise Suppression: check if player feet are on the green pitch
+                    # Context-Aware Background Noise Suppression:
+                    # Use the BOTTOM-THIRD midpoint (not just very bottom edge) as the "feet" position
+                    # to be robust against slight contour gaps at the pitch boundary.
                     if field_contour is not None:
                         cx_feet = (x1 + x2) // 2
-                        cy_feet = y2
-                        if cv2.pointPolygonTest(field_contour, (cx_feet, cy_feet), False) < 0:
+                        cy_feet = y1 + int((y2 - y1) * 0.75)   # 75% down the box = near feet
+                        pt_test = cv2.pointPolygonTest(field_contour, (float(cx_feet), float(cy_feet)), True)
+                        # Allow up to 10px outside contour to avoid edge-clipping valid players
+                        if pt_test < -10.0:
                             continue  # Suppress false positives on stands/ads/goalposts
-                            
+
                     # Player: check if it matches the active possessor player from previous frame
                     is_active_player = False
                     if last_active_player_box is not None:
                         ax1, ay1, ax2, ay2 = last_active_player_box
-                        # Calculate IoU or distance to determine if it is the same active player
                         xA = max(x1, ax1)
                         yA = max(y1, ay1)
                         xB = min(x2, ax2)
@@ -895,19 +899,18 @@ def process_video(job_id: str,
                         activeArea = (ax2 - ax1) * (ay2 - ay1)
                         unionArea = boxArea + activeArea - interArea
                         iou = interArea / float(unionArea) if unionArea > 0 else 0
-                        
-                        cx = (x1 + x2) / 2.0
-                        cy = (y1 + y2) / 2.0
+
+                        cx  = (x1 + x2) / 2.0
+                        cy  = (y1 + y2) / 2.0
                         acx = (ax1 + ax2) / 2.0
                         acy = (ay1 + ay2) / 2.0
                         dist = math.sqrt((cx - acx)**2 + (cy - acy)**2)
-                        
-                        if iou > 0.2 or dist < 40.0:
+
+                        if iou > 0.15 or dist < 45.0:
                             is_active_player = True
-                    
-                    # Strictly lower threshold for the active player (0.15) to prevent dropouts,
-                    # while maintaining a higher threshold (0.35) for off-ball players to keep the field clean.
-                    required_conf = 0.15 if is_active_player else 0.35
+
+                    # Lower conf threshold for the active ball-carrier to prevent dropouts.
+                    required_conf = 0.12 if is_active_player else 0.30
                     if conf > required_conf:
                         players_small.append((x1, y1, x2, y2))
                 elif cls_id == 32:                       # ball
@@ -1277,19 +1280,20 @@ def process_video(job_id: str,
                             crowded_players.add(tid1)
                             crowded_players.add(tid2)
 
-            # Update blur alpha factors (possession-based inverse blur: active possessor unblurred, off-ball players blurred)
+            # Absolute Spatial Proximity Rule:
+            # The active possessor is INSTANTLY forced to blur=0.0 (no ramp delay).
+            # Off-ball players ramp gradually to blur=1.0.
+            # This prevents the inversion scenario where the possessor appears blurred
+            # because of a slow fade-in during possession changes.
             for track_id, box in tracked_players_small:
                 if possessor_track_id is not None and track_id == possessor_track_id:
-                    target_alpha = 0.0
+                    # Hard snap to fully clear — no ramp
+                    blur_factors[track_id] = 0.0
                 else:
                     target_alpha = 1.0
-
-                current_alpha = blur_factors.get(track_id, 1.0)
-                if current_alpha < target_alpha:
+                    current_alpha = blur_factors.get(track_id, 1.0)
                     new_alpha = min(target_alpha, current_alpha + alpha_step)
-                else:
-                    new_alpha = max(target_alpha, current_alpha - alpha_step)
-                blur_factors[track_id] = new_alpha
+                    blur_factors[track_id] = new_alpha
 
             # Clean up stale track IDs in blur_factors
             blur_factors = {tid: val for tid, val in blur_factors.items() if tid in current_track_ids}
