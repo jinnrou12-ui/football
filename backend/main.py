@@ -120,6 +120,33 @@ def dist_to_box(bx: float, by: float, x1: float, y1: float, x2: float, y2: float
     cy = max(y1, min(by, y2))
     return euclidean(bx, by, cx, cy)
 
+def get_field_contour(frame_small: np.ndarray) -> np.ndarray | None:
+    # Convert to HSV color space
+    hsv = cv2.cvtColor(frame_small, cv2.COLOR_BGR2HSV)
+    
+    # Define green color range for football pitch (broad green range adapting to shadow/sun)
+    lower_green = np.array([30, 30, 30])
+    upper_green = np.array([85, 255, 255])
+    
+    # Create mask and apply morphological operations to clean up
+    mask = cv2.inRange(hsv, lower_green, upper_green)
+    
+    # Fill in holes (morphological close/open)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    
+    # Find contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        # Return the contour with the largest area (the pitch)
+        largest_contour = max(contours, key=cv2.contourArea)
+        # Only accept if it takes a reasonable portion of the frame
+        if cv2.contourArea(largest_contour) > (frame_small.shape[0] * frame_small.shape[1] * 0.15):
+            return largest_contour
+    return None
+
+
 
 def get_box_overlap(boxA: tuple[int, int, int, int], boxB: tuple[int, int, int, int]) -> int:
     """Calculate the intersection area between two bounding boxes."""
@@ -434,62 +461,70 @@ class IoUTracker:
             proj_box = (box[0] + vx, box[1] + vy, box[2] + vx, box[3] + vy)
             projected_boxes[track_id] = proj_box
 
-        # 2. Compute similarity matrix using projected boxes, distances, and velocity consistency
-        candidates = []
-        for track_id, track_data in self.tracks.items():
-            if track_data["lost_frames"] > self.max_lost_frames:
-                continue
-            
-            proj_box = projected_boxes[track_id]
-            proj_cx = (proj_box[0] + proj_box[2]) / 2.0
-            proj_cy = (proj_box[1] + proj_box[3]) / 2.0
-            
-            old_box = track_data["box"]
-            old_cx = (old_box[0] + old_box[2]) / 2.0
-            old_cy = (old_box[1] + old_box[3]) / 2.0
-            
-            vx, vy = track_data.get("velocity", (0.0, 0.0))
-            track_speed = math.sqrt(vx**2 + vy**2)
-            
-            # Dynamic matching distance based on speed (X2 Boost)
-            max_match_dist = 90.0 + 4.0 * track_speed
-            
-            for det_idx, det in enumerate(detections):
-                iou = self.calculate_iou(proj_box, det)
-                det_cx = (det[0] + det[2]) / 2.0
-                det_cy = (det[1] + det[3]) / 2.0
-                dist = math.sqrt((proj_cx - det_cx)**2 + (proj_cy - det_cy)**2)
-                
-                # Direction consistency score (ID-memory lock)
-                dir_consistency = 0.0
-                if track_speed > 2.0:
-                    dx = det_cx - old_cx
-                    dy = det_cy - old_cy
-                    disp_len = math.sqrt(dx**2 + dy**2)
-                    if disp_len > 0.5:
-                        cos_sim = (vx * dx + vy * dy) / (track_speed * disp_len)
-                        # Reward same direction, penalize opposite direction
-                        dir_consistency = 0.3 * cos_sim
-                        
-                # Allow matching if there is either reasonable IoU overlap or very close proximity
-                if iou >= self.iou_threshold or dist < max_match_dist:
-                    score = iou + dir_consistency
-                    if dist < 20.0:
-                        score += 0.3
-                    candidates.append((score, track_id, det_idx, dist))
-
-        # Sort candidates by score descending to perform global competitive matching
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
+        # 2. Hungarian Bipartite Matching using scipy.optimize.linear_sum_assignment
+        active_track_ids = [tid for tid, td in self.tracks.items() if td["lost_frames"] <= self.max_lost_frames]
+        
         matched_tracks = {}
         matched_detections = set()
-
-        for score, track_id, det_idx, dist in candidates:
-            if track_id in matched_tracks or det_idx in matched_detections:
-                continue
+        
+        if active_track_ids and detections:
+            from scipy.optimize import linear_sum_assignment
             
-            matched_tracks[track_id] = det_idx
-            matched_detections.add(det_idx)
+            num_tracks = len(active_track_ids)
+            num_dets = len(detections)
+            # Create a large-value cost matrix for unmatchable pairs
+            cost_matrix = np.full((num_tracks, num_dets), 1e6, dtype=np.float32)
+            
+            for i, track_id in enumerate(active_track_ids):
+                track_data = self.tracks[track_id]
+                proj_box = projected_boxes[track_id]
+                proj_cx = (proj_box[0] + proj_box[2]) / 2.0
+                proj_cy = (proj_box[1] + proj_box[3]) / 2.0
+                
+                old_box = track_data["box"]
+                old_cx = (old_box[0] + old_box[2]) / 2.0
+                old_cy = (old_box[1] + old_box[3]) / 2.0
+                
+                vx, vy = track_data.get("velocity", (0.0, 0.0))
+                track_speed = math.sqrt(vx**2 + vy**2)
+                
+                # Dynamic matching distance based on speed (X2 Boost)
+                max_match_dist = 90.0 + 4.0 * track_speed
+                
+                for j, det in enumerate(detections):
+                    iou = self.calculate_iou(proj_box, det)
+                    det_cx = (det[0] + det[2]) / 2.0
+                    det_cy = (det[1] + det[3]) / 2.0
+                    dist = math.sqrt((proj_cx - det_cx)**2 + (proj_cy - det_cy)**2)
+                    
+                    # Direction consistency score (ID-memory lock)
+                    dir_consistency = 0.0
+                    if track_speed > 2.0:
+                        dx = det_cx - old_cx
+                        dy = det_cy - old_cy
+                        disp_len = math.sqrt(dx**2 + dy**2)
+                        if disp_len > 0.5:
+                            cos_sim = (vx * dx + vy * dy) / (track_speed * disp_len)
+                            # Reward same direction, penalize opposite direction
+                            dir_consistency = 0.3 * cos_sim
+                            
+                    # Allow matching if there is either reasonable IoU overlap or very close proximity
+                    if iou >= self.iou_threshold or dist < max_match_dist:
+                        score = iou + dir_consistency
+                        if dist < 20.0:
+                            score += 0.3
+                        # Hungarian cost: we want to maximize score, so cost is negative score
+                        cost_matrix[i, j] = -score
+            
+            # Run Hungarian linear sum assignment
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            
+            for r, c in zip(row_ind, col_ind):
+                # Only accept match if it is actually valid (less than cost matrix threshold)
+                if cost_matrix[r, c] < 1e5:
+                    tid = active_track_ids[r]
+                    matched_tracks[tid] = c
+                    matched_detections.add(c)
 
         # Estimate camera motion (global displacement) from matched tracks
         dx_list = []
@@ -810,6 +845,7 @@ def process_video(job_id: str,
                 break
                 
             frame_small = cv2.resize(frame, (640, 360))
+            field_contour = get_field_contour(frame_small)
             
             # YOLO inference on 640x360 frame (lower conf threshold to 0.05 for x2 boost and zero dropouts)
             results = model(frame_small, conf=0.05, verbose=False)[0]
@@ -823,6 +859,13 @@ def process_video(job_id: str,
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
                 if cls_id == 0:
+                    # Context-Aware Background Noise Suppression: check if player feet are on the green pitch
+                    if field_contour is not None:
+                        cx_feet = (x1 + x2) // 2
+                        cy_feet = y2
+                        if cv2.pointPolygonTest(field_contour, (cx_feet, cy_feet), False) < 0:
+                            continue  # Suppress false positives on stands/ads/goalposts
+                            
                     # Player: check if it matches the active possessor player from previous frame
                     is_active_player = False
                     if last_active_player_box is not None:
@@ -856,6 +899,14 @@ def process_video(job_id: str,
                     # Ball: strictly lower confidence to 0.05
                     if conf > 0.05:
                         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        
+                        # Background noise suppression for ball:
+                        # Ensure the ball candidate is on the grass/pitch (or very close to it)
+                        if field_contour is not None:
+                            dist_to_pitch = cv2.pointPolygonTest(field_contour, (cx, cy), True)
+                            if dist_to_pitch < -40.0:
+                                continue
+                                
                         r = max(4, (x2 - x1 + y2 - y1) // 4)
                         ball_candidates_small.append(((cx, cy), r, conf))
 
@@ -900,29 +951,43 @@ def process_video(job_id: str,
             best_score = -1
             best_candidate = None
             best_radius = 6
+            high_conf_candidate = None
 
+            # First, check if there is a very high confidence candidate (e.g. conf > 0.4)
+            # which indicates the real ball (especially during close-up zoom-ins)
             for (cx, cy), r, conf in ball_candidates_small:
-                if ref_pos is not None:
-                    dist = euclidean(cx, cy, ref_pos[0], ref_pos[1])
-                    if dist < 120:
-                        score = conf * (1.0 - (dist / 120.0) * 0.4)
-                        if score > best_score:
-                            best_score = score
-                            best_candidate = (cx, cy)
-                            best_radius = r
-                else:
-                    if conf > 0.05:
-                        if conf > best_score:
-                            best_score = conf
-                            best_candidate = (cx, cy)
-                            best_radius = r
+                if conf > 0.4:
+                    if high_conf_candidate is None or conf > high_conf_candidate[2]:
+                        high_conf_candidate = ((cx, cy), r, conf)
+
+            if high_conf_candidate is not None:
+                # Force dynamic recalibration: trust the high-confidence detection directly
+                best_candidate, best_radius, best_score = high_conf_candidate
+            else:
+                # Otherwise, use reference-position gating (standard tracking)
+                for (cx, cy), r, conf in ball_candidates_small:
+                    if ref_pos is not None:
+                        dist = euclidean(cx, cy, ref_pos[0], ref_pos[1])
+                        if dist < 120:
+                            score = conf * (1.0 - (dist / 120.0) * 0.4)
+                            if score > best_score:
+                                best_score = score
+                                best_candidate = (cx, cy)
+                                best_radius = r
+                    else:
+                        if conf > 0.05:
+                            if conf > best_score:
+                                best_score = conf
+                                best_candidate = (cx, cy)
+                                best_radius = r
 
             # Update filter state and raw centers
             current_ball = None
             current_radius = last_ball_radius
 
             if best_candidate is not None:
-                if not kf.initialized:
+                if not kf.initialized or high_conf_candidate is not None:
+                    # Reset/reinitialize Kalman Filter on high-confidence recalibration point
                     kf.initialize(best_candidate[0], best_candidate[1])
                     kf_x, kf_y = float(best_candidate[0]), float(best_candidate[1])
                 else:
@@ -968,9 +1033,7 @@ def process_video(job_id: str,
                 min_dist = float("inf")
                 closest_box = None
                 for track_id, (x1, y1, x2, y2) in tracked_players_small:
-                    fx = (x1 + x2) // 2
-                    fy = y2
-                    dist = euclidean(bx, by, fx, fy)
+                    dist = dist_to_box(bx, by, x1, y1, x2, y2)
                     if dist < min_dist:
                         min_dist = dist
                         closest_box = (x1, y1, x2, y2)
@@ -1004,9 +1067,7 @@ def process_video(job_id: str,
                 closest_track_id = None
                 
                 for track_id, (x1, y1, x2, y2) in tracked_players_small:
-                    fx = (x1 + x2) // 2
-                    fy = y2
-                    dist = euclidean(bx, by, fx, fy)
+                    dist = dist_to_box(bx, by, x1, y1, x2, y2)
                     if dist < min_dist:
                         min_dist = dist
                         closest_track_id = track_id
@@ -1014,6 +1075,26 @@ def process_video(job_id: str,
                 if min_dist <= scaled_threshold:
                     possessor_track_id = closest_track_id
             raw_possessor_ids.append(possessor_track_id)
+
+        # Dense Crowding Re-ID Locking (5-frame look-ahead/look-back buffer prediction gap filling)
+        filled_possessors = list(raw_possessor_ids)
+        for i in range(len(filled_possessors)):
+            if filled_possessors[i] is None:
+                left_val = None
+                for j in range(i - 1, max(-1, i - 6), -1):
+                    if filled_possessors[j] is not None:
+                        left_val = filled_possessors[j]
+                        break
+                right_val = None
+                for j in range(i + 1, min(len(filled_possessors), i + 6)):
+                    if filled_possessors[j] is not None:
+                        right_val = filled_possessors[j]
+                        break
+                # If the same player had possession before and after a brief gap (occlusion),
+                # maintain their labeled state!
+                if left_val is not None and left_val == right_val:
+                    filled_possessors[i] = left_val
+        raw_possessor_ids = filled_possessors
 
         # Compute future receivers (up to 10 frames look-ahead)
         future_possessor_ids = [None] * len(raw_possessor_ids)
