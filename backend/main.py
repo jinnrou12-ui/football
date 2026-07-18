@@ -145,7 +145,8 @@ def apply_possession_highlight(frame: np.ndarray,
                                 x1: int, y1: int, x2: int, y2: int,
                                 color: tuple[int, int, int]) -> None:
     """Draw a coloured rectangle around the possessing player without any text label."""
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+    # Bounding boxes completely disabled as per user instruction
+    pass
 
 
 def blur_player_box_with_alpha(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, alpha: float) -> None:
@@ -1134,7 +1135,8 @@ def process_video(job_id: str,
                         int(round(tracker_bgr[1] * 0.4 + 180 * 0.6)),
                         int(round(tracker_bgr[2] * 0.4 + 180 * 0.6))
                     )
-                    cv2.rectangle(frame_out, (s_box[0], s_box[1]), (s_box[2], s_box[3]), receiver_color, 1, cv2.LINE_AA)
+                    # Bounding boxes completely disabled as per user instruction
+                    # cv2.rectangle(frame_out, (s_box[0], s_box[1]), (s_box[2], s_box[3]), receiver_color, 1, cv2.LINE_AA)
                     
                     rec_alpha = 1.0 - (future_k / 10.0)
                     draw_name_tag_with_alpha(frame_out, s_box[0], s_box[1], s_box[2], s_box[3], display_name + " (REC)", receiver_color, alpha=rec_alpha)

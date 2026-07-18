@@ -87,10 +87,10 @@ function App() {
     e.stopPropagation(); // prevent triggering upload-zone file dialog click
     try {
       showToast('Downloading sample match video...');
-      const response = await fetch('/vdo football test.mp4');
+      const response = await fetch('/demo_match.mp4');
       if (!response.ok) throw new Error('Sample video not found in public folder');
       const blob = await response.blob();
-      const sampleFile = new File([blob], 'vdo football test.mp4', { type: 'video/mp4' });
+      const sampleFile = new File([blob], 'demo_match.mp4', { type: 'video/mp4' });
       setFile(sampleFile);
       setFileUrl(URL.createObjectURL(sampleFile));
       setProcessedVideoUrl(null);
